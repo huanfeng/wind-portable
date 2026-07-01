@@ -1,0 +1,9 @@
+target/
+build/
+build_dev/
+dist/
+temp/
+.cache/
+.omc/
+.omx/
+
