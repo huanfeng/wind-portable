@@ -233,7 +233,7 @@ impl Ui {
     fn update_clicked(&self) {
         let Some(mgr) = self.mgr.clone() else { return };
         let owner = self.owner();
-        let Some(zip) = dialog::pick_zip(owner, "选择便携版更新包") else {
+        let Some(zip) = dialog::pick_zip("选择便携版更新包") else {
             return;
         };
         if let Err(e) = deploy::validate_zip(&zip, &mgr.variant) {
@@ -270,7 +270,7 @@ impl Ui {
     fn deploy_copy_clicked(&self) {
         let Some(mgr) = self.mgr.clone() else { return };
         let owner = self.owner();
-        let Some(target) = dialog::pick_folder(owner, "选择部署目标目录") else {
+        let Some(target) = dialog::pick_folder("选择部署目标目录") else {
             return;
         };
         if layout::is_protected_dir(&target) {
@@ -313,14 +313,14 @@ impl Ui {
     fn deploy_zip_clicked(&self) {
         let Some(mgr) = self.mgr.clone() else { return };
         let owner = self.owner();
-        let Some(zip) = dialog::pick_zip(owner, "选择便携版压缩包") else {
+        let Some(zip) = dialog::pick_zip("选择便携版压缩包") else {
             return;
         };
         if let Err(e) = deploy::validate_zip(&zip, &mgr.variant) {
             dialog::error(owner, &format!("无效的压缩包：{e}"), &self.title);
             return;
         }
-        let Some(target) = dialog::pick_folder(owner, "选择部署目标目录") else {
+        let Some(target) = dialog::pick_folder("选择部署目标目录") else {
             return;
         };
         if layout::is_protected_dir(&target) {
@@ -463,7 +463,11 @@ pub fn run(manager: Option<ServiceManager>, variant: &Variant, detect_error: Opt
     let en_deploy: Signal<bool> = signal(false);
     let busy: Signal<bool> = signal(false);
 
-    let mut app = App::new(title.clone(), 454, 286).bg(Color::hex(CARD));
+    // resizable(false)：去掉 WS_THICKFRAME 与最大化按钮，窗口尺寸固定。
+    // 尺寸固定后布局无法手动救回，故窗口略留余量、由 run_page 末尾的弹性占位吸收。
+    let mut app = App::new(title.clone(), 430, 262)
+        .bg(Color::hex(CARD))
+        .resizable(false);
 
     // 跨线程通道：后台 send → UI 线程 on_message 写 Signal → 框架局部重绘。
     // Signal 是 Copy，闭包直接捕获（无需 clone）。
@@ -674,7 +678,7 @@ fn build_content(ui: &Ui) -> Element {
         Element::button(label)
             .enabled(en)
             .weight(1.0)
-            .height(34)
+            .height(30)
             .on_click(move |_| on())
     };
     let row = || Element::row().width_match().spacing(10);
@@ -685,28 +689,28 @@ fn build_content(ui: &Ui) -> Element {
     // 「运行」页：状态/详情/目录 + 启停/设置/数据（对应原 C# tabRun）。
     let run_page = Element::col()
         .fill()
-        .padding(14)
-        .spacing(8)
+        .padding(10)
+        .spacing(6)
         .child(
             // label_rc 绑定 Signal<String>，Signal 变化时自动局部刷新文字。
             Element::label_rc(ui.status)
-                .font_size(17.0)
+                .font_size(16.0)
                 .fg(Color::hex(FG))
-                .height(24)
+                .height(22)
                 .width_match(),
         )
         .child(
             Element::label_rc(ui.detail)
                 .font_size(13.0)
                 .fg(Color::hex(SUB))
-                .height(46)
+                .height(40)
                 .width_match(),
         )
         .child(
             Element::label_rc(ui.dir)
                 .font_size(12.0)
                 .fg(Color::hex(SUB))
-                .height(32)
+                .height(22)
                 .width_match(),
         )
         .child(
@@ -740,13 +744,13 @@ fn build_content(ui: &Ui) -> Element {
     // 「部署」页：提示 + 更新/复制/ZIP + 结果行（对应原 C# tabDeploy）。
     let deploy_page = Element::col()
         .fill()
-        .padding(14)
-        .spacing(8)
+        .padding(10)
+        .spacing(6)
         .child(
             Element::label("更新当前安装、复制当前文件到新目录、或从 ZIP 包部署到新目录。")
                 .font_size(12.0)
                 .fg(Color::hex(SUB))
-                .height(40)
+                .height(36)
                 .width_match(),
         )
         .child(
@@ -787,6 +791,6 @@ fn build_content(ui: &Ui) -> Element {
     Element::col()
         .fill()
         .bg(Color::hex(CARD))
-        .padding(6)
+        .padding(4)
         .child(tabs)
 }
