@@ -7,13 +7,21 @@ fn main() {
     }
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let out = std::env::var("OUT_DIR").unwrap();
-    // 版本号优先取项目 docs/VERSION（发版时 release.yml 把 tag 版本写入它，统一各产物的资源版本）；
-    // 缺失则回退 CARGO_PKG_VERSION。
+    // 版本优先级: WIND_APP_VERSION (WindInput 打包脚本/CI 从 docs/VERSION 注入) > docs/VERSION 文件 > CARGO_PKG_VERSION。
+    // 注: 本仓是独立 sibling, {manifest}/../docs/VERSION 并不指向 WindInput/docs/VERSION（层级不符, 通常落空）,
+    //     故主要依赖 WIND_APP_VERSION 注入, 与 wind_input / wind_tsf / wind-setting / 安装包统一。
+    println!("cargo:rerun-if-env-changed=WIND_APP_VERSION");
     let version_file = format!("{manifest}/../docs/VERSION");
-    let ver = std::fs::read_to_string(&version_file)
+    let ver = std::env::var("WIND_APP_VERSION")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string(&version_file)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
         .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap()); // 如 0.0.1-alpha
                                                                          // 数字 FILEVERSION 取版本号的 a.b.c 前缀（去掉 -alpha/-dev.xxxx 等后缀）。
     let core = ver.split(['-', '+']).next().unwrap_or("0.0.0");
@@ -39,13 +47,13 @@ fn main() {
          \x20 BEGIN\n\
          \x20   BLOCK \"080404B0\"\n\
          \x20   BEGIN\n\
-         \x20     VALUE \"CompanyName\", \"WindInput Contributors\"\n\
-         \x20     VALUE \"FileDescription\", \"清风输入法便携启动器\"\n\
+         \x20     VALUE \"CompanyName\", \"清风输入法\"\n\
+         \x20     VALUE \"FileDescription\", \"清风输入法启动器\"\n\
          \x20     VALUE \"FileVersion\", \"{ver}\"\n\
          \x20     VALUE \"InternalName\", \"wind_portable\"\n\
-         \x20     VALUE \"LegalCopyright\", \"Copyright (C) 2026 WindInput Contributors\"\n\
+         \x20     VALUE \"LegalCopyright\", \"Copyright © 清风输入法\"\n\
          \x20     VALUE \"OriginalFilename\", \"wind_portable.exe\"\n\
-         \x20     VALUE \"ProductName\", \"清风输入法 (WindInput)\"\n\
+         \x20     VALUE \"ProductName\", \"清风输入法\"\n\
          \x20     VALUE \"ProductVersion\", \"{ver}\"\n\
          \x20   END\n\
          \x20 END\n\
