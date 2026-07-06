@@ -1032,9 +1032,9 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "windui"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a06c056c901dd1523cae3c0879fee0864f367c2bd579eca4b043d2cb2e6b0c76"
+checksum = "3eaa46f73afa028c968ab26aee8d2e809c24b83c52794cb0aba23bf3a1946005"
 dependencies = [
  "objc2",
  "objc2-app-kit",
