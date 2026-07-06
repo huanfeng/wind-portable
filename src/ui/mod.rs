@@ -11,6 +11,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use windui::core::EventCtx;
 use windui::prelude::*;
 
 use crate::service::ServiceManager;
@@ -230,131 +231,149 @@ impl Ui {
     }
 
     /// 在线更新：选 ZIP → 校验 → 确认 → 后台停服/替换/重启。
-    fn update_clicked(&self) {
-        let Some(mgr) = self.mgr.clone() else { return };
-        let owner = self.owner();
-        let Some(zip) = dialog::pick_zip("选择便携版更新包") else {
-            return;
-        };
-        if let Err(e) = deploy::validate_zip(&zip, &mgr.variant) {
-            dialog::error(owner, &format!("无效的更新包：{e}"), &self.title);
-            return;
-        }
-        if !dialog::confirm(
-            owner,
-            &format!("确认从以下文件更新便携版？\n\n{}", zip.display()),
-            "确认更新",
-        ) {
-            return;
-        }
-        self.begin_busy(
-            "正在更新...",
-            "正在停止服务并替换文件",
-            "正在更新：停止服务并替换文件…",
-        );
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let outcome = match mgr.update_from_zip(&zip) {
-                Ok(true) => Some("更新完成。启动器自身已更新，请关闭后重新打开。".to_string()),
-                Ok(false) => Some("便携版更新完成。".to_string()),
-                Err(e) => Some(e.to_string()),
+    ///
+    /// 整段"选文件→校验→确认"都是阻塞式原生模态调用（`PickDialog`/`MessageBoxW`），
+    /// 必须经 `ctx.defer_blocking` 延后到事件分发完全返回之后才执行——直接在
+    /// `on_click` 回调里同步调用会在 OS 鼠标捕获尚未释放时重入模态对话框的消息泵，
+    /// 反复点击/关闭几次就会把鼠标彻底锁死（同一类问题见 wind-ui-rust 的
+    /// `DialogRequest` 文档）。闭包内可以放心连续弹多个原生模态框：此时已经不在
+    /// 事件回调栈内了。
+    fn update_clicked(&self, ctx: &mut EventCtx) {
+        let this = self.clone();
+        ctx.defer_blocking(move || {
+            let Some(mgr) = this.mgr.clone() else { return };
+            let owner = this.owner();
+            let Some(zip) = dialog::pick_zip("选择便携版更新包") else {
+                return;
             };
-            let _ = tx.send(SnapMsg::Done {
-                snap: compute_snapshot(&mgr),
-                outcome,
+            if let Err(e) = deploy::validate_zip(&zip, &mgr.variant) {
+                dialog::error(owner, &format!("无效的更新包：{e}"), &this.title);
+                return;
+            }
+            if !dialog::confirm(
+                owner,
+                &format!("确认从以下文件更新便携版？\n\n{}", zip.display()),
+                "确认更新",
+            ) {
+                return;
+            }
+            this.begin_busy(
+                "正在更新...",
+                "正在停止服务并替换文件",
+                "正在更新：停止服务并替换文件…",
+            );
+            let tx = this.tx.clone();
+            std::thread::spawn(move || {
+                let outcome = match mgr.update_from_zip(&zip) {
+                    Ok(true) => Some("更新完成。启动器自身已更新，请关闭后重新打开。".to_string()),
+                    Ok(false) => Some("便携版更新完成。".to_string()),
+                    Err(e) => Some(e.to_string()),
+                };
+                let _ = tx.send(SnapMsg::Done {
+                    snap: compute_snapshot(&mgr),
+                    outcome,
+                });
             });
         });
     }
 
     /// 复制部署：选目标目录 → 确认 → 后台复制当前文件。
-    fn deploy_copy_clicked(&self) {
-        let Some(mgr) = self.mgr.clone() else { return };
-        let owner = self.owner();
-        let Some(target) = dialog::pick_folder("选择部署目标目录") else {
-            return;
-        };
-        if layout::is_protected_dir(&target) {
-            dialog::error(
-                owner,
-                &format!("不能部署到系统保护目录：\n{}", target.display()),
-                &self.title,
-            );
-            return;
-        }
-        if !dialog::confirm(
-            owner,
-            &format!("确认将当前文件复制到：\n\n{}", target.display()),
-            "确认部署",
-        ) {
-            return;
-        }
-        self.begin_busy(
-            "正在部署...",
-            "正在复制文件到目标目录",
-            "正在复制文件到目标目录…",
-        );
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let outcome = match mgr.deploy_to_directory(&target) {
-                Ok(()) => Some(format!(
-                    "已部署到：{}\n请到该目录运行 wind_portable.exe 启动。",
-                    target.display()
-                )),
-                Err(e) => Some(format!("部署失败：{e}")),
+    /// 阻塞式原生调用延后到事件分发返回后执行，理由同 [`Ui::update_clicked`]。
+    fn deploy_copy_clicked(&self, ctx: &mut EventCtx) {
+        let this = self.clone();
+        ctx.defer_blocking(move || {
+            let Some(mgr) = this.mgr.clone() else { return };
+            let owner = this.owner();
+            let Some(target) = dialog::pick_folder("选择部署目标目录") else {
+                return;
             };
-            let _ = tx.send(SnapMsg::Done {
-                snap: compute_snapshot(&mgr),
-                outcome,
+            if layout::is_protected_dir(&target) {
+                dialog::error(
+                    owner,
+                    &format!("不能部署到系统保护目录：\n{}", target.display()),
+                    &this.title,
+                );
+                return;
+            }
+            if !dialog::confirm(
+                owner,
+                &format!("确认将当前文件复制到：\n\n{}", target.display()),
+                "确认部署",
+            ) {
+                return;
+            }
+            this.begin_busy(
+                "正在部署...",
+                "正在复制文件到目标目录",
+                "正在复制文件到目标目录…",
+            );
+            let tx = this.tx.clone();
+            std::thread::spawn(move || {
+                let outcome = match mgr.deploy_to_directory(&target) {
+                    Ok(()) => Some(format!(
+                        "已部署到：{}\n请到该目录运行 wind_portable.exe 启动。",
+                        target.display()
+                    )),
+                    Err(e) => Some(format!("部署失败：{e}")),
+                };
+                let _ = tx.send(SnapMsg::Done {
+                    snap: compute_snapshot(&mgr),
+                    outcome,
+                });
             });
         });
     }
 
     /// 从 ZIP 部署到新目录：选 ZIP → 校验 → 选目标 → 确认 → 后台解压。
-    fn deploy_zip_clicked(&self) {
-        let Some(mgr) = self.mgr.clone() else { return };
-        let owner = self.owner();
-        let Some(zip) = dialog::pick_zip("选择便携版压缩包") else {
-            return;
-        };
-        if let Err(e) = deploy::validate_zip(&zip, &mgr.variant) {
-            dialog::error(owner, &format!("无效的压缩包：{e}"), &self.title);
-            return;
-        }
-        let Some(target) = dialog::pick_folder("选择部署目标目录") else {
-            return;
-        };
-        if layout::is_protected_dir(&target) {
-            dialog::error(
-                owner,
-                &format!("不能部署到系统保护目录：\n{}", target.display()),
-                &self.title,
-            );
-            return;
-        }
-        if !dialog::confirm(
-            owner,
-            &format!("确认将 ZIP 部署到：\n\n{}", target.display()),
-            "确认部署",
-        ) {
-            return;
-        }
-        self.begin_busy(
-            "正在部署...",
-            "正在解压文件到目标目录",
-            "正在解压文件到目标目录…",
-        );
-        let tx = self.tx.clone();
-        std::thread::spawn(move || {
-            let outcome = match mgr.deploy_zip_to_directory(&zip, &target) {
-                Ok(()) => Some(format!(
-                    "已部署到：{}\n请到该目录运行 wind_portable.exe 启动。",
-                    target.display()
-                )),
-                Err(e) => Some(format!("部署失败：{e}")),
+    /// 阻塞式原生调用延后到事件分发返回后执行，理由同 [`Ui::update_clicked`]。
+    fn deploy_zip_clicked(&self, ctx: &mut EventCtx) {
+        let this = self.clone();
+        ctx.defer_blocking(move || {
+            let Some(mgr) = this.mgr.clone() else { return };
+            let owner = this.owner();
+            let Some(zip) = dialog::pick_zip("选择便携版压缩包") else {
+                return;
             };
-            let _ = tx.send(SnapMsg::Done {
-                snap: compute_snapshot(&mgr),
-                outcome,
+            if let Err(e) = deploy::validate_zip(&zip, &mgr.variant) {
+                dialog::error(owner, &format!("无效的压缩包：{e}"), &this.title);
+                return;
+            }
+            let Some(target) = dialog::pick_folder("选择部署目标目录") else {
+                return;
+            };
+            if layout::is_protected_dir(&target) {
+                dialog::error(
+                    owner,
+                    &format!("不能部署到系统保护目录：\n{}", target.display()),
+                    &this.title,
+                );
+                return;
+            }
+            if !dialog::confirm(
+                owner,
+                &format!("确认将 ZIP 部署到：\n\n{}", target.display()),
+                "确认部署",
+            ) {
+                return;
+            }
+            this.begin_busy(
+                "正在部署...",
+                "正在解压文件到目标目录",
+                "正在解压文件到目标目录…",
+            );
+            let tx = this.tx.clone();
+            std::thread::spawn(move || {
+                let outcome = match mgr.deploy_zip_to_directory(&zip, &target) {
+                    Ok(()) => Some(format!(
+                        "已部署到：{}\n请到该目录运行 wind_portable.exe 启动。",
+                        target.display()
+                    )),
+                    Err(e) => Some(format!("部署失败：{e}")),
+                };
+                let _ = tx.send(SnapMsg::Done {
+                    snap: compute_snapshot(&mgr),
+                    outcome,
+                });
             });
         });
     }
@@ -674,12 +693,14 @@ fn build_tray(ui: &Ui) -> Tray {
 /// 去掉了旧版"隐藏 visible_when 同步器"——Signal::set() 自动触发脏区，无需该 hack。
 fn build_content(ui: &Ui) -> Element {
     // Signal<bool> 是 Copy，action_button 直接持有，无需 Rc 包装。
-    let action_button = |label: &str, en: Signal<bool>, on: Box<dyn Fn()>| {
+    // `on` 接收 `&mut EventCtx`：需要弹原生对话框的动作（部署/更新）经
+    // `ctx.defer_blocking` 延后执行，不需要的动作直接忽略这个参数即可。
+    let action_button = |label: &str, en: Signal<bool>, on: Box<dyn Fn(&mut EventCtx)>| {
         Element::button(label)
             .enabled(en)
             .weight(1.0)
             .height(30)
-            .on_click(move |_| on())
+            .on_click(move |ctx| on(ctx))
     };
     let row = || Element::row().width_match().spacing(10);
 
@@ -718,12 +739,12 @@ fn build_content(ui: &Ui) -> Element {
                 .child(action_button(
                     "启动服务",
                     ui.en_start,
-                    Box::new(move || u_start.start_clicked()),
+                    Box::new(move |_ctx| u_start.start_clicked()),
                 ))
                 .child(action_button(
                     "停止服务",
                     ui.en_stop,
-                    Box::new(move || u_stop.stop_clicked()),
+                    Box::new(move |_ctx| u_stop.stop_clicked()),
                 )),
         )
         .child(
@@ -731,12 +752,12 @@ fn build_content(ui: &Ui) -> Element {
                 .child(action_button(
                     "打开设置",
                     ui.en_settings,
-                    Box::new(move || u_set.settings_clicked()),
+                    Box::new(move |_ctx| u_set.settings_clicked()),
                 ))
                 .child(action_button(
                     "打开数据目录",
                     ui.en_data,
-                    Box::new(move || u_data.data_clicked()),
+                    Box::new(move |_ctx| u_data.data_clicked()),
                 )),
         )
         .child(Element::label("").weight(1.0).width_match());
@@ -758,17 +779,17 @@ fn build_content(ui: &Ui) -> Element {
                 .child(action_button(
                     "更新当前版本",
                     ui.en_update,
-                    Box::new(move || u_update.update_clicked()),
+                    Box::new(move |ctx| u_update.update_clicked(ctx)),
                 ))
                 .child(action_button(
                     "复制到目录",
                     ui.en_deploy,
-                    Box::new(move || u_dcopy.deploy_copy_clicked()),
+                    Box::new(move |ctx| u_dcopy.deploy_copy_clicked(ctx)),
                 ))
                 .child(action_button(
                     "从 ZIP 部署",
                     ui.en_deploy,
-                    Box::new(move || u_dzip.deploy_zip_clicked()),
+                    Box::new(move |ctx| u_dzip.deploy_zip_clicked(ctx)),
                 )),
         )
         .child(
