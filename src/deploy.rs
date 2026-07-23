@@ -87,7 +87,7 @@ pub fn deploy_from_zip(zip_path: &Path, target_dir: &Path) -> Result<bool> {
     Ok(needs_restart)
 }
 
-/// 从目录复制部署到目标目录（跳过 `userdata/`）。
+/// 从目录复制部署到目标目录（跳过 `userdata/` 与安装版专属文件，见 [`skip_in_copy`]）。
 pub fn deploy_from_directory(src_dir: &Path, target_dir: &Path) -> Result<()> {
     if same_dir(src_dir, target_dir) {
         bail!("源目录与目标目录相同");
@@ -96,17 +96,7 @@ pub fn deploy_from_directory(src_dir: &Path, target_dir: &Path) -> Result<()> {
     collect_files(src_dir, &mut files).map_err(|e| anyhow!("枚举源文件失败: {e}"))?;
     for src in files {
         let rel = src.strip_prefix(src_dir).unwrap_or(&src);
-        // 跳过用户数据目录。
-        if rel
-            .components()
-            .next()
-            .map(|c| {
-                c.as_os_str()
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case("userdata")
-            })
-            .unwrap_or(false)
-        {
+        if skip_in_copy(rel) {
             continue;
         }
         let dst = target_dir.join(rel);
@@ -149,6 +139,25 @@ fn is_backup_name(name: &str) -> bool {
 }
 
 // ── 内部 ──
+
+/// 复制部署时应跳过的相对路径。
+///
+/// - `userdata/`：用户数据不随便携包分发。
+/// - 根级 `uninstall.exe`：安装版专属。它若被带到目标目录，会让目标在便携运行时被
+///   [`crate::registration`] 的 `is_installed_directory` 误判为"安装目录"而禁用便携模式
+///   ——"把安装版复制到 U 盘当便携用"就是栽在这里：复制看似成功，到了别处却打不开。
+///   仅拦根级（`rel` 无子层级），避免误伤用户目录里同名文件。
+fn skip_in_copy(rel: &Path) -> bool {
+    let mut comps = rel.components();
+    let Some(first) = comps.next() else {
+        return false;
+    };
+    let first = first.as_os_str().to_string_lossy();
+    if first.eq_ignore_ascii_case("userdata") {
+        return true; // userdata 整个目录（含所有子层级）
+    }
+    comps.next().is_none() && first.eq_ignore_ascii_case("uninstall.exe")
+}
 
 fn extract_to<R: Read>(entry: &mut R, dst: &Path) -> io::Result<()> {
     let mut out = fs::File::create(dst)?;
@@ -220,6 +229,28 @@ mod tests {
         assert!(dst.join("data").join("config.toml").is_file());
         // userdata 被跳过。
         assert!(!dst.join("userdata").exists());
+    }
+
+    #[test]
+    fn deploy_from_directory_skips_uninstaller() {
+        // 场景：从安装目录复制到别处当便携用。安装版专属的 uninstall.exe 必须留下，
+        // 否则目标会被 is_installed_directory 误判为安装目录、便携模式失效。
+        let src = tempdir();
+        let dst = tempdir();
+        fs::write(src.join("wind_input.exe"), b"exe").unwrap();
+        fs::write(src.join("uninstall.exe"), b"unins").unwrap();
+        // 子目录下的同名文件不受影响（仅拦根级）。
+        fs::create_dir_all(src.join("tools")).unwrap();
+        fs::write(src.join("tools").join("uninstall.exe"), b"keep").unwrap();
+
+        deploy_from_directory(&src, &dst).unwrap();
+
+        assert!(dst.join("wind_input.exe").is_file());
+        assert!(!dst.join("uninstall.exe").exists(), "根级卸载器应被跳过");
+        assert!(
+            dst.join("tools").join("uninstall.exe").is_file(),
+            "子目录同名文件应照常复制"
+        );
     }
 
     #[test]
