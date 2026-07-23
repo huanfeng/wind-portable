@@ -33,9 +33,32 @@ fn main() {
     // 用 UTF-8（无 BOM）+ #pragma code_page(65001)，使 RC 编译器按 UTF-8 解析中文字符串
     //（embed-resource 先用 clang-cl 预处理，不支持 UTF-16 BOM）。
     let ico = format!("{manifest}/res/app.ico"); // 正斜杠，避免 .rc 转义
+
+    // 应用清单：声明 Common-Controls 6.0.0.0 → 系统对话框（MessageBox / TaskDialog）启用
+    // 视觉样式，按钮从经典方角变为现代主题化外观。**故意不声明 dpiAware**：windui 运行时
+    // 调 SetProcessDpiAwarenessContext(PER_MONITOR_V2)，manifest 里的 DPI 声明优先级更高，
+    // 一旦写上会锁死并使 windui 的运行时设置失败。这里只启用视觉样式，不碰 DPI。
+    let manifest_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n\
+        <assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">\r\n\
+        \x20 <dependency><dependentAssembly>\r\n\
+        \x20   <assemblyIdentity type=\"win32\" name=\"Microsoft.Windows.Common-Controls\" \
+        version=\"6.0.0.0\" processorArchitecture=\"*\" publicKeyToken=\"6595b64144ccf1df\" \
+        language=\"*\"/>\r\n\
+        \x20 </dependentAssembly></dependency>\r\n\
+        </assembly>\r\n";
+    let mft_path = format!("{out}/wind_portable.manifest");
+    std::fs::File::create(&mft_path)
+        .unwrap()
+        .write_all(manifest_xml.as_bytes())
+        .unwrap();
+    // RT_MANIFEST(24) id 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID（exe 主清单）。
+    // 正斜杠：本机 Windows 构建时 OUT_DIR 为反斜杠，进 .rc 字符串会被当转义序列。
+    let mft_rc = mft_path.replace('\\', "/");
+
     let rc = format!(
         "#pragma code_page(65001)\n\
          1 ICON \"{ico}\"\n\
+         1 24 \"{mft_rc}\"\n\
          \n\
          1 VERSIONINFO\n\
          FILEVERSION {maj},{min},{pat},0\n\
