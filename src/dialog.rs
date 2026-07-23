@@ -15,8 +15,8 @@ use windui::prelude::PickDialog;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, MessageBoxW, IDOK, MB_ICONERROR, MB_ICONQUESTION, MB_OKCANCEL, MESSAGEBOX_RESULT,
-    MESSAGEBOX_STYLE,
+    FindWindowW, MessageBoxW, IDNO, IDOK, IDYES, MB_ICONERROR, MB_ICONQUESTION, MB_OKCANCEL,
+    MB_YESNOCANCEL, MESSAGEBOX_RESULT, MESSAGEBOX_STYLE,
 };
 
 /// 按标题找启动器窗口（用作消息框 owner，保证模态）。
@@ -42,6 +42,25 @@ pub fn pick_folder(title: &str) -> Option<PathBuf> {
 /// 确认对话框（确定/取消）。返回是否点了"确定"。
 pub fn confirm(owner: Option<HWND>, text: &str, caption: &str) -> bool {
     msgbox(owner, text, caption, MB_OKCANCEL | MB_ICONQUESTION) == IDOK
+}
+
+/// 三态询问的结果（对应"是 / 否 / 取消"）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    Yes,
+    No,
+    Cancel,
+}
+
+/// 三态询问（是/否/取消）。用于"顺带做某事"与"仅执行主动作"需要区分的场景——
+/// 两态确认框会把"否"和"取消"压成同一个答案，语义丢失。
+/// 关闭标题栏 × 等同"取消"（`MessageBoxW` 在 MB_YESNOCANCEL 下返回 IDCANCEL）。
+pub fn ask(owner: Option<HWND>, text: &str, caption: &str) -> Answer {
+    match msgbox(owner, text, caption, MB_YESNOCANCEL | MB_ICONQUESTION) {
+        IDYES => Answer::Yes,
+        IDNO => Answer::No,
+        _ => Answer::Cancel,
+    }
 }
 
 /// 错误提示。
