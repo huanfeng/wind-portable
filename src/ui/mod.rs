@@ -34,14 +34,6 @@ const START_CONFIRM_TRIES: u32 = 40; // ×500ms ≈ 20s
 /// 决定隐藏态下托盘菜单反映状态变化的最大额外滞后。
 const TRAY_ENABLE_SYNC: Duration = Duration::from_millis(400);
 
-/// 退出确认文案。三态语义要在文字里说清楚，否则"否"很容易被读成"取消"。
-///
-/// 开头不写"服务正在运行"：服务已停但 TSF 注册未撤销（如服务崩溃）时也会走到这里，
-/// 那句话就成了假话。"仍处于已启用状态"对两种残留都成立。
-const EXIT_PROMPT: &str = "清风输入法仍处于已启用状态。\n\n\
-     是——停止服务并卸载（移除开机自启与 TSF 注册）\n\
-     否——仅关闭启动器，输入法继续可用\n\
-     取消——不退出";
 
 /// 退出流程的跨线程状态。用 Atomic 而非 Signal：确认流程整个跑在后台线程，
 /// 而 Signal 存活于 UI 线程的线程局部 arena，只能在 UI 线程读写。
@@ -464,7 +456,14 @@ impl Ui {
                 if !mgr.service_running() && !mgr.is_registered() {
                     exit.allow(owner);
                 } else {
-                    match dialog::ask(owner, EXIT_PROMPT, &title) {
+                    let answer = dialog::ask_commands(
+                        owner,
+                        &title,
+                        "清风输入法仍处于已启用状态",
+                        ("停止服务并卸载", "移除开机自启与 TSF 注册"),
+                        ("仅关闭启动器", "输入法继续可用，稍后可再启动"),
+                    );
+                    match answer {
                         // 卸载：停服 + 移除自启 + 注销 TSF（可能触发 UAC，故必须在后台线程）。
                         dialog::Answer::Yes => match mgr.stop_service() {
                             Ok(_) => exit.allow(owner),

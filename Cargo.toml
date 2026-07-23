@@ -33,6 +33,8 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
     "Win32_UI_Controls_Dialogs",
+    # TaskDialogIndirect（现代命令链接对话框）；结构体 Default 依赖 WindowsAndMessaging（已含）。
+    "Win32_UI_Controls",
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Com",
     "Win32_System_LibraryLoader",
