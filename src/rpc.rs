@@ -37,11 +37,19 @@ struct RpcResponse {
 }
 
 /// 控制通道端点：Windows 命名管道 / Unix 套接字。
+///
+/// **两侧的后缀位置不同，且都由服务端 `wind-rpc::server` 决定，不可"对称"地想当然**：
+/// - Windows 管道名后缀在**末尾**：`wind_input_ctrl{suffix}`
+///   （release `wind_input_ctrl`、dev `wind_input_ctrl_dev`）。
+/// - Unix 套接字后缀在**中间**：`wind_input{suffix}_ctrl.sock`。
+///
+/// 曾把 Windows 侧写成 `wind_input{suffix}_ctrl`：release 因 suffix 为空而巧合相等、
+/// 一直正常，dev 版则永远连不上（探活恒为"未运行"，实际服务在跑）。
 pub fn ctrl_endpoint(variant: &Variant) -> String {
     let suffix = &variant.pipe_suffix;
     #[cfg(windows)]
     {
-        format!(r"\\.\pipe\wind_input{suffix}_ctrl")
+        format!(r"\\.\pipe\wind_input_ctrl{suffix}")
     }
     #[cfg(not(windows))]
     {
@@ -137,6 +145,26 @@ fn read_frame<R: Read>(r: &mut R) -> std::io::Result<Vec<u8>> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// 端点名必须与主仓 `wind-rpc::server::ctrl_endpoint` 逐字一致。
+    /// dev 断言是重点：release 因后缀为空，写错位置也照样相等，测不出问题。
+    #[test]
+    fn ctrl_endpoint_matches_core() {
+        let (release, dev) = (
+            ctrl_endpoint(&Variant::new(false)),
+            ctrl_endpoint(&Variant::new(true)),
+        );
+        #[cfg(windows)]
+        {
+            assert_eq!(release, r"\\.\pipe\wind_input_ctrl");
+            assert_eq!(dev, r"\\.\pipe\wind_input_ctrl_dev");
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(release.ends_with("/wind_input_ctrl.sock"));
+            assert!(dev.ends_with("/wind_input_dev_ctrl.sock"));
+        }
+    }
 
     #[test]
     fn frame_roundtrip() {
