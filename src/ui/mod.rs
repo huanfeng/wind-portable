@@ -8,7 +8,8 @@
 //! - 启停/部署/更新在后台线程跑 `Arc<ServiceManager>`；完成时发 `SnapMsg::Done`，
 //!   最新快照与可选结果行一起写回 UI。
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use windui::core::EventCtx;
@@ -29,6 +30,85 @@ const POLL_INTERVAL: Duration = Duration::from_millis(600);
 const IDLE_INTERVAL: Duration = Duration::from_millis(800);
 /// 启动后确认"就绪"的最长等待。
 const START_CONFIRM_TRIES: u32 = 40; // ×500ms ≈ 20s
+/// 托盘菜单启用态同步间隔。仅在值变化时写 Signal，空闲不产生重绘；
+/// 决定隐藏态下托盘菜单反映状态变化的最大额外滞后。
+const TRAY_ENABLE_SYNC: Duration = Duration::from_millis(400);
+
+/// 退出确认文案。三态语义要在文字里说清楚，否则"否"很容易被读成"取消"。
+///
+/// 开头不写"服务正在运行"：服务已停但 TSF 注册未撤销（如服务崩溃）时也会走到这里，
+/// 那句话就成了假话。"仍处于已启用状态"对两种残留都成立。
+const EXIT_PROMPT: &str = "清风输入法仍处于已启用状态。\n\n\
+     是——停止服务并卸载（移除开机自启与 TSF 注册）\n\
+     否——仅关闭启动器，输入法继续可用\n\
+     取消——不退出";
+
+/// 退出流程的跨线程状态。用 Atomic 而非 Signal：确认流程整个跑在后台线程，
+/// 而 Signal 存活于 UI 线程的线程局部 arena，只能在 UI 线程读写。
+#[derive(Default)]
+struct ExitState {
+    /// 退出已获准：置位后拦截器直接放行。
+    allowed: AtomicBool,
+    /// 确认流程进行中：拦截住重复的关闭请求（标题栏 X 与托盘「退出」都会投递
+    /// `WM_CLOSE`，而拦截器返回 false 只取消当次关闭、不阻止用户再点一次）。
+    /// 缺了这道闸门，确认框会一个叠一个地弹出来。
+    asking: AtomicBool,
+    /// 本次 `WM_CLOSE` 来自托盘「退出」而非标题栏 ×：区分"真要退出"与"收进托盘"。
+    /// 两者是同一条消息，不带标记就无从分辨。
+    intent: AtomicBool,
+}
+
+impl ExitState {
+    /// 抢占确认流程的所有权。已有确认在进行时返回 false（调用方应直接放弃）。
+    fn begin_ask(&self) -> bool {
+        self.asking
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// 确认流程收尾。一并清 `intent`：用户选了「取消」后这次退出意图就作废了，
+    /// 留着会让下一次点 × 误走退出流程而不是收进托盘。
+    fn end_ask(&self) {
+        self.intent.store(false, Ordering::SeqCst);
+        self.asking.store(false, Ordering::SeqCst);
+    }
+
+    /// 放行退出：置标志后重新投递 `WM_CLOSE`，让拦截器第二次进来时直接通过。
+    /// 走 `WM_CLOSE` 而非 `ExitProcess`，是为了让 windui 正常走完 `WM_DESTROY`
+    /// —— 托盘图标在那里 `NIM_DELETE`，硬退会在通知区留下要鼠标划过才消失的僵尸图标。
+    fn allow(&self, owner: Option<windows::Win32::Foundation::HWND>) {
+        self.allowed.store(true, Ordering::SeqCst);
+        post_close(owner);
+    }
+}
+
+/// 仅在值变化时写 Signal。`Signal::set` 每次都标脏请求重绘（不去重），
+/// 周期性同步必须先比较，否则可见态每个定时器拍都请求重绘、空闲 CPU 回不到 0。
+fn set_if(sig: Signal<bool>, v: bool) {
+    if sig.get() != v {
+        sig.set(v);
+    }
+}
+
+/// 隐藏主窗口（关闭按钮 → 收进托盘）。`ShowWindow` 可跨线程调用。
+fn hide_main_window(hwnd: Option<windows::Win32::Foundation::HWND>) {
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    if let Some(h) = hwnd {
+        unsafe {
+            let _ = ShowWindow(h, SW_HIDE);
+        }
+    }
+}
+
+/// 向主窗口投递 `WM_CLOSE`（跨线程安全：`PostMessageW` 只入队，不等待处理）。
+fn post_close(hwnd: Option<windows::Win32::Foundation::HWND>) {
+    use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+    if let Some(h) = hwnd {
+        unsafe {
+            let _ = PostMessageW(Some(h), WM_CLOSE, Default::default(), Default::default());
+        }
+    }
+}
 
 pub fn launcher_title(variant: &Variant) -> String {
     if variant.is_dev {
@@ -94,8 +174,21 @@ struct Ui {
     en_data: Signal<bool>,
     en_update: Signal<bool>,
     en_deploy: Signal<bool>,
-    // 后台操作进行中标志
+    // 后台操作进行中标志（仅供 UI 呈现：忽略轮询快照、置灰按钮）。
     busy: Signal<bool>,
+    // 同一事实的权威副本，供**非 UI 线程或窗口隐藏时**判断。
+    //
+    // 不能拿 `busy` Signal 当真相：它由后台线程经 channel 送回、在 `on_message` 里写，
+    // 而 windui 排空 channel 的 `pump()` 只跑在 `render()` 里（app.rs:1162）——
+    // Windows 不给隐藏窗口发 WM_PAINT，`Sender::send` 的 `InvalidateRect` 唤不出帧，
+    // 于是窗口收进托盘期间做的动作，其 `Done` 会一直躺在队列里，`busy` 永远停在 true
+    // （直到窗口再次显示才补上）。曾导致"托盘停服后无法退出，一直提示正在部署/更新"。
+    working: Arc<AtomicBool>,
+    // 最新快照的权威副本，理由同 `working`：Signal 要等绘制帧才更新，而窗口收进
+    // 托盘后再无绘制帧，此时托盘菜单是唯一的界面，只能读这里。
+    snap: Arc<Mutex<Snapshot>>,
+    // 退出流程状态（见 ExitState）。
+    exit: Arc<ExitState>,
     // 后台线程发回 UI 线程的通道
     tx: Sender<SnapMsg>,
 }
@@ -170,6 +263,88 @@ impl Ui {
         self.detail.set(detail.into());
         self.set_enables(false, false, false, false, false, false);
         self.busy.set(true);
+        self.working.store(true, Ordering::SeqCst);
+    }
+
+    /// 后台动作收尾：清权威标志，再把最新快照与结果送回 UI 线程。
+    ///
+    /// 顺序要紧：`working` 必须先于 `send` 清掉。`send` 只是入队 + 请求一帧，窗口隐藏
+    /// 时那一帧不会到来（见 [`Ui::working`]），此时唯一还准的就是这个标志。
+    fn finish_action(&self, mgr: &ServiceManager, outcome: Option<String>) {
+        let snap = compute_snapshot(mgr);
+        self.publish(&snap);
+        self.working.store(false, Ordering::SeqCst);
+        let _ = self.tx.send(SnapMsg::Done { snap, outcome });
+    }
+
+    /// 更新权威快照副本（任意线程可调）。
+    fn publish(&self, snap: &Snapshot) {
+        if let Ok(mut g) = self.snap.lock() {
+            *g = snap.clone();
+        }
+    }
+
+    /// 读权威快照副本。
+    fn snapshot(&self) -> Snapshot {
+        self.snap.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// 六个按钮的期望启用态 `(start, stop, settings, data, update, deploy)`。
+    ///
+    /// 唯一真值来源：托盘 `.enabled` 同步、托盘点击校验、窗口按钮都据此，逻辑不再各写一份。
+    /// 四种情形分层：探测失败 → 冲突 → 正忙 → 正常，与 `apply_snapshot_to_signals` 对齐。
+    fn desired_enables(&self) -> (bool, bool, bool, bool, bool, bool) {
+        if self.detect_error.is_some() {
+            return (false, false, false, false, false, false);
+        }
+        let s = self.snapshot();
+        if s.conflict.is_some() {
+            // 冲突态只放行"复制/ZIP 部署到其他目录"。
+            return (false, false, false, false, false, true);
+        }
+        if self.working.load(Ordering::SeqCst) {
+            return (false, false, false, false, false, false);
+        }
+        let running = s.running;
+        let stoppable = running || s.registered;
+        (!running, stoppable, running, true, true, true)
+    }
+
+    /// 把期望启用态同步进 en_* Signal（**必须在 UI 线程调**，如 `on_interval`）。
+    ///
+    /// 托盘菜单 `.enabled` 在右键弹出时实时读 Signal，而 channel 只在绘制帧刷新 Signal——
+    /// 窗口收进托盘后没有绘制帧，Signal 会停在收起那刻，菜单灰显随之卡死。靠 WM_TIMER
+    /// （隐藏态照常触发）周期重算写入，弹出的菜单才拿得到当前状态。
+    /// **仅在值变化时 set**：`Signal::set` 不去重，无条件写会让可见态每拍请求重绘（毁掉空闲 0 CPU）。
+    fn refresh_enables(&self) {
+        let (start, stop, settings, data, update, deploy) = self.desired_enables();
+        set_if(self.en_start, start);
+        set_if(self.en_stop, stop);
+        set_if(self.en_settings, settings);
+        set_if(self.en_data, data);
+        set_if(self.en_update, update);
+        set_if(self.en_deploy, deploy);
+    }
+
+    /// 托盘「启动服务」此刻是否可用。
+    fn can_start(&self) -> bool {
+        self.desired_enables().0
+    }
+
+    /// 托盘「停止服务」此刻是否可用。注册残留（服务已挂但 TSF 还在）也算可停。
+    fn can_stop(&self) -> bool {
+        self.desired_enables().1
+    }
+
+    /// 动作不可用时的气泡说明。冲突与"正忙"要说清，否则用户只看到点了没反应。
+    fn blocked_reason(&self, default: &str) -> String {
+        if self.working.load(Ordering::SeqCst) {
+            return "正在执行上一个操作，请稍候".into();
+        }
+        match self.snapshot().conflict {
+            Some(reason) => reason,
+            None => default.into(),
+        }
     }
 
     fn owner(&self) -> Option<windows::Win32::Foundation::HWND> {
@@ -180,7 +355,7 @@ impl Ui {
     fn start_clicked(&self) {
         let Some(mgr) = self.mgr.clone() else { return };
         self.begin_busy("正在启动服务...", "等待服务就绪", "");
-        let tx = self.tx.clone();
+        let this = self.clone();
         std::thread::spawn(move || {
             let r = mgr.start_service();
             if r.is_ok() {
@@ -191,10 +366,7 @@ impl Ui {
                     std::thread::sleep(Duration::from_millis(500));
                 }
             }
-            let _ = tx.send(SnapMsg::Done {
-                snap: compute_snapshot(&mgr),
-                outcome: r.err().map(|e| e.to_string()),
-            });
+            this.finish_action(&mgr, r.err().map(|e| e.to_string()));
         });
     }
 
@@ -202,14 +374,115 @@ impl Ui {
     fn stop_clicked(&self) {
         let Some(mgr) = self.mgr.clone() else { return };
         self.begin_busy("正在停止服务...", "", "");
-        let tx = self.tx.clone();
+        let this = self.clone();
         std::thread::spawn(move || {
             let r = mgr.stop_service();
-            let _ = tx.send(SnapMsg::Done {
-                snap: compute_snapshot(&mgr),
-                outcome: r.err().map(|e| e.to_string()),
-            });
+            this.finish_action(&mgr, r.err().map(|e| e.to_string()));
         });
+    }
+
+    /// 发起退出（托盘「退出」菜单）。
+    ///
+    /// **不能用 `ctx.quit()`**：windui 的 `TrayCtx::quit()` 直接 `DestroyWindow`，
+    /// 绕过 `WM_CLOSE`，`on_close_request` 拦截器根本不会被调用——托盘退出就会跳过
+    /// 卸载确认。改为标记"这是真退出"后投递 `WM_CLOSE`，汇入同一条拦截链。
+    fn request_exit(&self) {
+        self.exit.intent.store(true, Ordering::SeqCst);
+        post_close(self.owner());
+    }
+
+    /// 标题栏 × / ESC 的关闭请求：服务在跑时**收进托盘而非退出**。
+    ///
+    /// 输入法启动器的「关闭」几乎总是"我看完了，收起来"，而不是"把输入法卸了"——
+    /// 后者代价太大且不可逆（要重新注册 TSF）。真正的退出留给托盘右键「退出」。
+    /// 服务没在跑时窗口已无常驻价值，直接走退出流程（无残留则静默退出）。
+    fn close_clicked(&self) -> bool {
+        // 确认流程放行后重投的 WM_CLOSE：直接过。
+        // **必须排在收纳分支之前**——选了「否」（保留服务）时服务仍在跑，
+        // 落到下面就会被收进托盘，退不掉。
+        if self.exit.allowed.load(Ordering::SeqCst) {
+            return true;
+        }
+        // 托盘「退出」投递来的 WM_CLOSE：直奔退出流程，不做收纳。
+        if self.exit.intent.load(Ordering::SeqCst) {
+            return self.confirm_exit();
+        }
+        // 冲突态（已安装版本占用）→ 直接退出，不收托盘。
+        // 此时探活探到的 running 是**安装版**的服务，不是我们的；启动器本身被禁用、
+        // 无任何驻留价值，收进托盘只会让用户以为"关不掉"。confirm_exit 也会因冲突
+        // 走直接放行（无残留可清理），这里提前拦下省掉一次无谓的 WM_CLOSE 往返。
+        let snap = self.snapshot();
+        if snap.conflict.is_some() {
+            return true;
+        }
+        // 服务在跑 → 收进托盘。返回 false 取消关闭，窗口由 hide_main_window 隐藏。
+        // 探测失败（无 mgr）时没有服务可守候，不留托盘。
+        //
+        // 读缓存快照而非现探活：本回调运行在 WndProc 持有窗口状态借用的临界区里，
+        // 不宜做阻塞 I/O。这里只决定"收起还是退出"，最多差一个轮询周期；真正有
+        // 后果的卸载判断在 confirm_exit 的后台线程里重新探活。
+        if self.mgr.is_some() && snap.running {
+            hide_main_window(self.owner());
+            return false;
+        }
+        self.confirm_exit()
+    }
+
+    /// 关闭请求拦截器（`App::on_close_request`）：服务仍在运行或注册未撤销时，
+    /// 先问用户是否顺带卸载，再决定是否放行。返回 `true` 放行、`false` 取消本次关闭。
+    ///
+    /// **回调内绝不能同步弹模态框**：它由 WndProc 在持有窗口状态可变借用的临界区里
+    /// 调用，而 `MessageBoxW` 自带嵌套消息泵——泵到 `WM_PAINT` 就会重入 WndProc 再取
+    /// 一次同一份状态（裸指针别名 UB）。因此这里只做 UI 线程上非阻塞的 Signal 读取，
+    /// 弹框、探活与停服全部丢给后台线程，本次调用立即返回 `false`；线程拿到结果后置
+    /// `exiting` 并重新投递 `WM_CLOSE`，第二次进来在开头直接放行。
+    fn confirm_exit(&self) -> bool {
+        if self.exit.allowed.load(Ordering::SeqCst) {
+            return true;
+        }
+        // 已有确认框在弹了：忽略这次请求，别再叠一个。
+        if !self.exit.begin_ask() {
+            return false;
+        }
+        // 读权威标志而非 `busy` Signal：窗口收在托盘里时 Signal 是陈旧的（见 Ui::working）。
+        let busy = self.working.load(Ordering::SeqCst);
+        // 冲突态（已安装版本占用）：启动器未注册未起进程，无副作用可清理，直接放行。
+        let conflict = self.snapshot().conflict.is_some();
+        // HWND 非 Send，拆成裸整数过线程边界，用时再还原。
+        let owner_raw = self.owner().map(|h| h.0 as isize);
+        let (title, mgr, exit) = (self.title.clone(), self.mgr.clone(), self.exit.clone());
+
+        std::thread::spawn(move || {
+            let owner = owner_raw.map(|v| windows::Win32::Foundation::HWND(v as *mut _));
+            // 部署/更新进行中：此刻退出会留下半替换的文件树，先拦住。
+            if busy {
+                dialog::error(owner, "正在部署/更新，请等待完成后再退出。", &title);
+            } else if conflict {
+                exit.allow(owner);
+            } else if let Some(mgr) = mgr {
+                // 服务未跑且注册已撤销 → 无残留，不打扰用户。
+                if !mgr.service_running() && !mgr.is_registered() {
+                    exit.allow(owner);
+                } else {
+                    match dialog::ask(owner, EXIT_PROMPT, &title) {
+                        // 卸载：停服 + 移除自启 + 注销 TSF（可能触发 UAC，故必须在后台线程）。
+                        dialog::Answer::Yes => match mgr.stop_service() {
+                            Ok(_) => exit.allow(owner),
+                            // 残留没清干净就别退出，留在原地让用户重试或改选「否」。
+                            Err(e) => dialog::error(owner, &format!("卸载失败：{e}"), &title),
+                        },
+                        // 保留：仅关启动器，输入法继续可用（符合输入法直觉）。
+                        dialog::Answer::No => exit.allow(owner),
+                        dialog::Answer::Cancel => {}
+                    }
+                }
+            } else {
+                // 布局探测失败（无 mgr）：没有副作用可清理，直接放行。
+                exit.allow(owner);
+            }
+            exit.end_ask();
+        });
+        false
     }
 
     /// 打开设置（inline）。
@@ -262,17 +535,13 @@ impl Ui {
                 "正在停止服务并替换文件",
                 "正在更新：停止服务并替换文件…",
             );
-            let tx = this.tx.clone();
             std::thread::spawn(move || {
                 let outcome = match mgr.update_from_zip(&zip) {
                     Ok(true) => Some("更新完成。启动器自身已更新，请关闭后重新打开。".to_string()),
                     Ok(false) => Some("便携版更新完成。".to_string()),
                     Err(e) => Some(e.to_string()),
                 };
-                let _ = tx.send(SnapMsg::Done {
-                    snap: compute_snapshot(&mgr),
-                    outcome,
-                });
+                this.finish_action(&mgr, outcome);
             });
         });
     }
@@ -307,7 +576,6 @@ impl Ui {
                 "正在复制文件到目标目录",
                 "正在复制文件到目标目录…",
             );
-            let tx = this.tx.clone();
             std::thread::spawn(move || {
                 let outcome = match mgr.deploy_to_directory(&target) {
                     Ok(()) => Some(format!(
@@ -316,10 +584,7 @@ impl Ui {
                     )),
                     Err(e) => Some(format!("部署失败：{e}")),
                 };
-                let _ = tx.send(SnapMsg::Done {
-                    snap: compute_snapshot(&mgr),
-                    outcome,
-                });
+                this.finish_action(&mgr, outcome);
             });
         });
     }
@@ -361,7 +626,6 @@ impl Ui {
                 "正在解压文件到目标目录",
                 "正在解压文件到目标目录…",
             );
-            let tx = this.tx.clone();
             std::thread::spawn(move || {
                 let outcome = match mgr.deploy_zip_to_directory(&zip, &target) {
                     Ok(()) => Some(format!(
@@ -370,10 +634,7 @@ impl Ui {
                     )),
                     Err(e) => Some(format!("部署失败：{e}")),
                 };
-                let _ = tx.send(SnapMsg::Done {
-                    snap: compute_snapshot(&mgr),
-                    outcome,
-                });
+                this.finish_action(&mgr, outcome);
             });
         });
     }
@@ -381,29 +642,35 @@ impl Ui {
 
 /// 后台轮询线程：窗口可见时周期算快照、变化时经 channel 推给 UI 线程；
 /// 隐藏到托盘时**暂停**轮询，仅低频探测可见性，并在刚隐藏那刻回收工作集。
-fn spawn_bg_poller(mgr: Arc<ServiceManager>, tx: Sender<SnapMsg>, title: String) {
+fn spawn_bg_poller(ui: Ui, mgr: Arc<ServiceManager>, title: String) {
     std::thread::spawn(move || {
         let mut prev: Option<Snapshot> = None;
         let mut was_visible = true;
         loop {
             let visible = window_visible(&title);
-            if visible {
-                was_visible = true;
+            // 隐藏时也照常算快照，只是放慢节奏：托盘菜单读的是权威副本，
+            // 而它此刻是唯一的界面。此前隐藏即完全停摆，收进托盘后停服，
+            // 菜单项会一直卡在旧状态（「启动服务」灰着点不动）。
+            // 动作执行期间跳过：finish_action 会给出更权威的收尾快照，
+            // 轮询插进来只会用中间态覆盖它。
+            if !ui.working.load(Ordering::SeqCst) {
                 let snap = compute_snapshot(&mgr);
+                ui.publish(&snap);
                 let changed = prev.as_ref() != Some(&snap);
                 prev = Some(snap.clone());
-                if changed {
-                    let _ = tx.send(SnapMsg::Poll(snap));
+                // 仅在窗口可见时推 UI：隐藏时没有绘制帧，消息只会堆在队列里。
+                if changed && visible {
+                    let _ = ui.tx.send(SnapMsg::Poll(snap));
                 }
-                std::thread::sleep(POLL_INTERVAL);
-            } else {
-                if was_visible {
-                    trim_working_set();
-                    was_visible = false;
-                    prev = None; // 再次显示时强制推送快照
-                }
-                std::thread::sleep(IDLE_INTERVAL);
             }
+            if visible {
+                was_visible = true;
+            } else if was_visible {
+                trim_working_set();
+                was_visible = false;
+                prev = None; // 再次显示时强制推送快照
+            }
+            std::thread::sleep(if visible { POLL_INTERVAL } else { IDLE_INTERVAL });
         }
     });
 }
@@ -542,25 +809,40 @@ pub fn run(manager: Option<ServiceManager>, variant: &Variant, detect_error: Opt
         en_update,
         en_deploy,
         busy,
-        tx: tx.clone(),
+        working: Arc::new(AtomicBool::new(false)),
+        snap: Arc::new(Mutex::new(Snapshot::default())),
+        exit: Arc::new(ExitState::default()),
+        tx,
     };
 
-    // 初始快照：UI 线程直接写 Signal（无需走 channel）。
+    // 初始快照：UI 线程直接写 Signal（无需走 channel），同时填好权威副本——
+    // 托盘菜单/关闭拦截在首个轮询周期到来前就可能被触发。
     if let Some(m) = &mgr {
-        ui.apply_snapshot(&compute_snapshot(m));
+        let snap = compute_snapshot(m);
+        ui.publish(&snap);
+        ui.apply_snapshot(&snap);
     } else if let Some(de) = &detect_error {
         status.set("便携模式不可用".into());
         detail.set(de.clone());
     }
 
-    // 后台轮询线程（窗口可见时每 600ms 推送一次快照）。
+    // 后台轮询线程（可见时每 600ms，收进托盘后降到 800ms 只维护权威副本）。
     if let Some(m) = mgr {
-        spawn_bg_poller(m, tx, title.clone());
+        spawn_bg_poller(ui.clone(), m, title.clone());
     }
 
     let tray = build_tray(&ui);
     let content = build_content(&ui);
-    app.tray(tray).content(content).run();
+    // 关闭拦截：标题栏 × 收进托盘，托盘「退出」走卸载确认（两者同经 WM_CLOSE）。
+    let u_close = ui.clone();
+    // 托盘菜单启用态同步：WM_TIMER 隐藏态照常触发，把权威快照写进 en_* Signal，
+    // 弹出的托盘菜单才拿得到当前状态（见 Ui::refresh_enables）。仅值变化时写，空闲不重绘。
+    let u_tick = ui.clone();
+    app.tray(tray)
+        .content(content)
+        .on_interval(TRAY_ENABLE_SYNC, move || u_tick.refresh_enables())
+        .on_close_request(move || u_close.close_clicked())
+        .run();
 }
 
 /// 把快照写入一组 Signal（供 channel on_message 和初始化共用的无 self 版本）。
@@ -640,6 +922,7 @@ fn apply_snapshot_to_signals(
 /// Signal<bool> 是 Copy，直接传给 `.enabled()` 和在回调中读取，无需 clone。
 fn build_tray(ui: &Ui) -> Tray {
     let (u_start, u_stop, u_set, u_data) = (ui.clone(), ui.clone(), ui.clone(), ui.clone());
+    let u_exit = ui.clone();
     let (icw, ich, icon) = app_icon_rgba(32);
     let toggle_title = ui.title.clone();
 
@@ -659,33 +942,38 @@ fn build_tray(ui: &Ui) -> Tray {
             TrayMenuItem::item("显示窗口", |ctx| ctx.show_window()),
             TrayMenuItem::item("隐藏到托盘", |ctx| ctx.hide_window()),
             TrayMenuItem::separator(),
+            // `.enabled(Signal)` 由 `on_interval → refresh_enables` 在 UI 线程周期刷新
+            // （WM_TIMER 隐藏态照常触发），弹出时 windui 实时读该 Signal 决定灰显。
+            // 点击回调再用 `desired_enables` 校验一次并给气泡：定时器最长滞后一拍，
+            // 且 Signal 与真值理论上可能瞬时错位，兜底防误触发。
             TrayMenuItem::item("启动服务", move |ctx| {
-                if u_start.en_start.get() {
+                if u_start.can_start() {
                     u_start.start_clicked();
                 } else {
-                    ctx.notify(&u_start.title, "服务已在运行");
+                    ctx.notify(&u_start.title, &u_start.blocked_reason("服务已在运行"));
                 }
             })
             .enabled(ui.en_start),
             TrayMenuItem::item("停止服务", move |ctx| {
-                if u_stop.en_stop.get() {
+                if u_stop.can_stop() {
                     u_stop.stop_clicked();
                 } else {
-                    ctx.notify(&u_stop.title, "服务未在运行");
+                    ctx.notify(&u_stop.title, &u_stop.blocked_reason("服务未在运行"));
                 }
             })
             .enabled(ui.en_stop),
             TrayMenuItem::item("打开设置", move |ctx| {
-                if u_set.en_settings.get() {
+                if u_set.desired_enables().2 {
                     u_set.settings_clicked();
                 } else {
-                    ctx.notify(&u_set.title, "请先启动服务再打开设置");
+                    ctx.notify(&u_set.title, &u_set.blocked_reason("请先启动服务再打开设置"));
                 }
             })
             .enabled(ui.en_settings),
             TrayMenuItem::item("数据目录", move |_| u_data.data_clicked()).enabled(ui.en_data),
             TrayMenuItem::separator(),
-            TrayMenuItem::item("退出", |ctx| ctx.quit()),
+            // 经 WM_CLOSE 汇入 on_close_request，与标题栏 × 同一条卸载确认链。
+            TrayMenuItem::item("退出", move |_| u_exit.request_exit()),
         ])
 }
 
