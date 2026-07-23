@@ -33,17 +33,14 @@ pub struct PortableConfig {
 }
 
 /// 用当前进程位置 + 工作目录探测便携布局。
+///
+/// **不因"位于系统保护目录"而失败**：那里的文件同样是齐全的一套便携包，探测不该谎称
+/// 找不到。保护目录改由 [`crate::registration::installed_conflict`] 报为冲突——便携模式
+/// 禁用、但"把这套文件复制到别处"的逃生口保持可用（探测失败会连 `ServiceManager` 一起
+/// 丢掉，复制部署便无源可用）。探测失败只保留一种含义：**真的没找到服务 exe**。
 pub fn detect(variant: &Variant) -> Result<PortableConfig> {
     let exe = std::env::current_exe().ok();
     let exe_dir = exe.as_deref().and_then(Path::parent).map(Path::to_path_buf);
-    if let Some(dir) = &exe_dir {
-        if is_protected_dir(dir) {
-            bail!(
-                "当前位于系统保护目录({})，不支持便携模式。\n请将便携包复制到其他目录运行。",
-                dir.display()
-            );
-        }
-    }
     let wd = std::env::current_dir().ok();
     let candidates = candidate_roots(exe_dir.as_deref(), wd.as_deref());
     detect_from(variant, &candidates)
@@ -214,6 +211,25 @@ mod tests {
             cfg.service_exe,
             root.join("build_dev").join("wind_input.exe")
         );
+        assert_eq!(cfg.root_dir, root);
+    }
+
+    /// 位于系统保护目录**不**让探测失败。
+    ///
+    /// 回归：保护目录曾在 `detect` 开头直接 `bail!`，导致安装版（默认装在 Program Files）
+    /// 里连 `PortableConfig` 都构造不出来 → `ServiceManager` 为 None → 「复制部署」按钮
+    /// 被 `desired_enables` 的 detect_error 分支全灰，用户无法把安装版复制出去当便携用。
+    /// 保护目录现由 `registration::installed_conflict` 报为冲突（便携功能禁用、部署放行）。
+    #[test]
+    fn detect_succeeds_inside_protected_dir() {
+        let v = Variant::new(false);
+        let root = tempdir();
+        std::fs::write(root.join("wind_input.exe"), b"x").unwrap();
+        // 把 root 自身当作"保护目录前缀"，确认判定确实命中……
+        let prefixes = vec![root.to_string_lossy().to_string()];
+        assert!(is_protected_under(&root.join("sub"), &prefixes));
+        // ……而探测层照常给出完整布局，不因此失败。
+        let cfg = detect_from(&v, std::slice::from_ref(&root)).unwrap();
         assert_eq!(cfg.root_dir, root);
     }
 

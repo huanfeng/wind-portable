@@ -109,7 +109,15 @@ pub fn installed_conflict(
                 .to_string(),
         );
     }
-    // 2. 其他位置注册了 DLL？
+    // 2. 当前目录在系统保护目录下（Program Files / Windows）。安装版通常两条都命中，
+    //    由上一条给出更具体的提示；这条兜住"手工把便携包放进 Program Files"的情形。
+    if crate::layout::is_protected_dir(&cfg.root_dir) {
+        return Some(
+            "当前位于系统保护目录，便携模式不可用。如需使用便携模式，请将文件复制到其他目录运行。"
+                .to_string(),
+        );
+    }
+    // 3. 其他位置注册了 DLL？
     let reg_path = registered_dll_path(variant)?;
     let dll = cfg.tsf_dll.as_deref()?;
     if same_path(&reg_path, &dll.to_string_lossy()) {
@@ -135,6 +143,9 @@ pub fn installed_conflict_path(cfg: &PortableConfig, variant: &Variant) -> Optio
         return Some(
             nsis_install_location(variant).unwrap_or_else(|| cfg.root_dir.to_string_lossy().into()),
         );
+    }
+    if crate::layout::is_protected_dir(&cfg.root_dir) {
+        return Some(cfg.root_dir.to_string_lossy().into());
     }
     registered_dll_path(variant)
 }

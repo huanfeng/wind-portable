@@ -253,9 +253,28 @@ impl Ui {
         self.notice.set(notice.into());
         self.status.set(status.into());
         self.detail.set(detail.into());
-        self.set_enables(false, false, false, false, false, false);
+        // 末位 deploy 保持 true，与 `desired_enables` 的正忙分支一致——否则 `refresh_enables`
+        // 下一拍就把它改回去，按钮会闪一下。
+        self.set_enables(false, false, false, false, false, true);
         self.busy.set(true);
         self.working.store(true, Ordering::SeqCst);
+    }
+
+    /// 已有后台操作在跑时拒绝新的部署，并说明原因。
+    ///
+    /// 部署按钮在正忙态照常可点（见 [`Ui::desired_enables`]），但真正并发跑两个动作会坏事：
+    /// `working` 是无条件写的标志，先完成的那个会替另一个把 busy 清掉，界面提前"解冻"；
+    /// 若正在跑的是原地更新，源目录的文件正被替换，此刻复制出去的会是半新半旧的一套。
+    fn reject_if_working(&self) -> bool {
+        if !self.working.load(Ordering::SeqCst) {
+            return false;
+        }
+        dialog::error(
+            self.owner(),
+            "当前有操作正在进行，请等待完成后再部署。",
+            &self.title,
+        );
+        true
     }
 
     /// 后台动作收尾：清权威标志，再把最新快照与结果送回 UI 线程。
@@ -285,6 +304,11 @@ impl Ui {
     ///
     /// 唯一真值来源：托盘 `.enabled` 同步、托盘点击校验、窗口按钮都据此，逻辑不再各写一份。
     /// 四种情形分层：探测失败 → 冲突 → 正忙 → 正常，与 `apply_snapshot_to_signals` 对齐。
+    ///
+    /// **部署是逃生口，不被环境状态挡住**：冲突态（含安装目录/系统保护目录）与正忙态都放行
+    /// 它——"把这套文件复制到别处"恰恰是这些场景下用户唯一需要的操作，灰掉它等于把人锁死。
+    /// 唯一例外是探测失败：那意味着根本没找到服务 exe，无源可复制。
+    /// 正忙态放行的是**按钮**，真正的并发由 [`Ui::reject_if_working`] 在点击入口挡下并说明原因。
     fn desired_enables(&self) -> (bool, bool, bool, bool, bool, bool) {
         if self.detect_error.is_some() {
             return (false, false, false, false, false, false);
@@ -295,7 +319,7 @@ impl Ui {
             return (false, false, false, false, false, true);
         }
         if self.working.load(Ordering::SeqCst) {
-            return (false, false, false, false, false, false);
+            return (false, false, false, false, false, true);
         }
         let running = s.running;
         let stoppable = running || s.registered;
@@ -551,6 +575,9 @@ impl Ui {
         let this = self.clone();
         ctx.defer_blocking(move || {
             let Some(mgr) = this.mgr.clone() else { return };
+            if this.reject_if_working() {
+                return;
+            }
             let owner = this.owner();
             let Some(target) = dialog::pick_folder("选择部署目标目录") else {
                 return;
@@ -594,6 +621,9 @@ impl Ui {
         let this = self.clone();
         ctx.defer_blocking(move || {
             let Some(mgr) = this.mgr.clone() else { return };
+            if this.reject_if_working() {
+                return;
+            }
             let owner = this.owner();
             let Some(zip) = dialog::pick_zip("选择便携版压缩包") else {
                 return;
