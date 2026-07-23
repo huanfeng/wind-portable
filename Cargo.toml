@@ -19,7 +19,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # 放进 windows target deps：Linux host 上 `cargo test` 跑纯逻辑（不拉 windui），
 # Windows 目标构建时才引入 GUI 框架与全部副作用模块。
 [target.'cfg(windows)'.dependencies]
-windui = { version = "0.8", default-features = false }
+windui = { version = "0.9", default-features = false }
 # 解码内嵌 app.ico → RGBA 供托盘图标使用（纯 Rust）。
 ico = "0.4"
 windows = { version = "0.62", features = [
