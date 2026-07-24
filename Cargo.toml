@@ -43,8 +43,11 @@ windows = { version = "0.62", features = [
 ] }
 
 [build-dependencies]
-# 把 app.ico 嵌入 exe 资源（Explorer 文件图标 + 默认窗口/任务栏图标）。
-embed-resource = "3"
+# 嵌入 exe 资源：图标 + 版本信息 + 应用清单(Common-Controls 6.0)。
+# 用 winresource（与 wind_input 同款）而非 embed-resource —— 后者在原生 windows CI 的
+# rc.exe 编译失败会连 manifest 一起丢，致 exe 因缺 comctl32 v6 的 TaskDialogIndirect
+# 入口点而无法启动；winresource 在同一 CI 环境(wind_input)已验证可正常嵌入。
+winresource = "0.1"
 
 [profile.release]
 opt-level = "z"
