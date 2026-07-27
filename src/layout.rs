@@ -16,7 +16,8 @@ pub struct PortableConfig {
     pub root_dir: PathBuf,
     /// 便携数据目录（root/userdata）。
     pub userdata_dir: PathBuf,
-    /// 便携标记文件路径（root/wind_portable_mode）。
+    /// 便携标记文件路径（root/portable_mode）。写入一律用新名；读取侧另认旧名，
+    /// 见 [`crate::variant::has_portable_marker_in`]。
     pub portable_marker: PathBuf,
     /// 服务可执行文件绝对路径。
     pub service_exe: PathBuf,
@@ -195,7 +196,7 @@ mod tests {
         assert_eq!(cfg.tsf_dll, Some(root.join("wind_tsf.dll")));
         assert_eq!(cfg.tsf_dll_x86, None);
         assert_eq!(cfg.userdata_dir, root.join("userdata"));
-        assert_eq!(cfg.portable_marker, root.join("wind_portable_mode"));
+        assert_eq!(cfg.portable_marker, root.join("portable_mode"));
         // setting 不存在 → 取约定位置。
         assert_eq!(cfg.setting_exe, root.join("wind_setting.exe"));
     }

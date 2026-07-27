@@ -249,6 +249,9 @@ impl ServiceManager {
             std::fs::create_dir_all(&dir)
                 .map_err(|e| anyhow!("创建目录失败 {}: {e}", dir.display()))?;
         }
+        // 存量便携目录里只有旧名 `wind_portable_mode`，这里会补建新名完成迁移。
+        // 旧名**刻意不删**：用户回退到旧版程序时它仍是唯一被认的标记，删了就退化成非便携。
+        // 两名并存无害——读取侧一律新名优先（见 IPCClient.cpp 的 break）。
         if !self.cfg.portable_marker.is_file() {
             std::fs::write(&self.cfg.portable_marker, "wind_portable=1\n")
                 .map_err(|e| anyhow!("写便携标记失败: {e}"))?;

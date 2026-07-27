@@ -20,7 +20,7 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 
 use crate::layout::PortableConfig;
-use crate::variant::{Variant, PORTABLE_MARKER_NAME};
+use crate::variant::{has_portable_marker_in, Variant};
 
 /// 隐藏子进程控制台窗口（CREATE_NO_WINDOW）。
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -318,11 +318,13 @@ fn is_installed_directory(root: &Path, variant: &Variant) -> bool {
     root.join("uninstall.exe").is_file()
 }
 
-/// DLL 同级是否存在便携标记文件（不向上遍历）。
+/// DLL 同级是否存在便携标记文件（不向上遍历）。新旧两名都认，见
+/// [`crate::variant::LEGACY_PORTABLE_MARKER_NAME`]——只认新名会把存量便携实例
+/// 误判成安装版注册，进而拒绝接管。
 fn has_portable_marker(dll_path: &str) -> bool {
     Path::new(dll_path)
         .parent()
-        .map(|d| d.join(PORTABLE_MARKER_NAME).is_file())
+        .map(has_portable_marker_in)
         .unwrap_or(false)
 }
 

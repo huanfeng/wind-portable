@@ -7,7 +7,19 @@
 use std::path::{Path, PathBuf};
 
 /// 便携模式标记文件名（放在便携包根目录，DLL 同级用于辨认便携实例）。
-pub const PORTABLE_MARKER_NAME: &str = "wind_portable_mode";
+///
+/// 与安装器清单 `[app] portable_marker` 及 wind-config 的 `PORTABLE_MARKER_NAME` **同名**
+/// ——三处曾不一致，安装包便携模式装出的目录主程序不认，数据落回 `%APPDATA%`。
+pub const PORTABLE_MARKER_NAME: &str = "portable_mode";
+
+/// 旧标记文件名，**仅用于读取兼容**：存量便携包里是这个名字。新写入一律用
+/// [`PORTABLE_MARKER_NAME`]，`ensure_layout` 会顺带补建新名完成迁移。
+pub const LEGACY_PORTABLE_MARKER_NAME: &str = "wind_portable_mode";
+
+/// 目录内是否存在便携标记（新名优先，旧名兼容）。
+pub fn has_portable_marker_in(dir: &Path) -> bool {
+    dir.join(PORTABLE_MARKER_NAME).is_file() || dir.join(LEGACY_PORTABLE_MARKER_NAME).is_file()
+}
 /// 便携数据目录名（相对便携包根目录）。
 pub const PORTABLE_DATA_DIR: &str = "userdata";
 
