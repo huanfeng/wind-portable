@@ -42,8 +42,9 @@ wind_portable -ui             # 强制 GUI（即使带了其他动作）
 
 ## 设计
 
-见 [`docs/superpowers/specs/2026-06-22-wind-portable-rust-design.md`](docs/superpowers/specs/2026-06-22-wind-portable-rust-design.md)。
-UI 实时刷新机制（windui 单线程约束下的隐藏轮询器 + active 窗口续帧）详见该文档"关键设计"节。
+见 [`docs/design.md`](docs/design.md)——职责、与服务的契约、变体常量、模块划分、运行流程、
+冲突检测、部署与在线更新、资源嵌入。UI 实时刷新机制（windui 单线程约束下的隐藏轮询器 +
+active 窗口续帧）详见该文档"关键设计"节。
 
 ## 测试
 
