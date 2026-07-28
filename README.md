@@ -52,6 +52,18 @@ active 窗口续帧）详见该文档"关键设计"节。
 - **Windows 副作用**：无法在 Linux 验证，需在 Windows 设备实测，清单见
   [`docs/wind_portable-windows-test-checklist.md`](docs/wind_portable-windows-test-checklist.md)。
 
+## 贡献
+
+欢迎 Bug 报告、功能建议与代码贡献，流程与开发环境要求见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+首次提交 PR 前需签署 [CLA](CLA.md)。
+
+输入法引擎本身（候选、编码、上屏、词库、主题）的问题请到主仓库
+[WindInput](https://github.com/huanfeng/WindInput/issues) 反馈。
+
+## 许可证
+
+本项目采用 [MIT 许可证](LICENSE)。
+
 ## 状态
 
 核心启动器 + 部署/在线更新完成（交叉编译通过 + 单测绿 + Windows clippy 干净），**待 Windows 设备实测**。

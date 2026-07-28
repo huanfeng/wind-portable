@@ -1,0 +1,10 @@
+# 文本文件一律以 LF 入库（检出时由各平台的 core.autocrlf 决定），
+# 避免 Windows 贡献者的 CRLF 工作副本产生整文件级别的无关 diff。
+* text=auto
+
+# Shell 脚本强制 LF —— CRLF 会让 `#!` 行解析失败（git hook 在 Linux/macOS 上直接不可用）
+*.sh text eol=lf
+.githooks/* text eol=lf
+
+# 二进制资源：禁止任何换行/文本转换与 diff 尝试
+*.ico binary

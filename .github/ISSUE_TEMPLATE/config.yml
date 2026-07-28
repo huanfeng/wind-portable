@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 输入法本体问题
+    url: https://github.com/huanfeng/WindInput/issues
+    about: 候选、编码、上屏、词库、主题等引擎相关问题请到 WindInput 主仓库反馈
+  - name: 使用文档
+    url: https://windinput.com/docs
+    about: 安装、配置、快捷键与常见问题，请先查阅在线文档
+  - name: 使用问题
+    url: https://github.com/huanfeng/WindInput/discussions
+    about: 文档未覆盖的使用问题或疑问请到 Discussions 讨论

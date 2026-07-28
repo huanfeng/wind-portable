@@ -3,6 +3,10 @@ name = "wind_portable"
 version = "0.0.1-alpha"
 edition = "2021"
 description = "清风输入法便携启动器（绿色版）"
+license = "MIT"
+repository = "https://github.com/huanfeng/wind-portable"
+homepage = "https://windinput.com"
+readme = "README.md"
 
 [[bin]]
 name = "wind_portable"

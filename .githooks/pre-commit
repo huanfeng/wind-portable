@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# 激活方式（一次性）: git config core.hooksPath .githooks
+set -e
+ROOT="$(git rev-parse --show-toplevel)"
+
+echo "[pre-commit] cargo fmt check..."
+
+cd "$ROOT"
+if ! cargo fmt --all -- --check 2>/dev/null; then
+    echo ""
+    echo "  格式检查失败，请运行: cargo fmt"
+    echo ""
+    exit 1
+fi
+
+echo "[pre-commit] fmt OK"

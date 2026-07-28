@@ -1,9 +1,20 @@
+# ---- 构建产物 ----
 target/
 build/
 build_dev/
 dist/
 temp/
 .cache/
+
+# ---- 本地工具 / AI 助手的运行状态（各自生成，不入库）----
 .omc/
 .omx/
+.claude/
+.remember/
+.superpowers/
+.playwright-mcp/
+# 本地任务指引与草稿设计稿；成稿归档到 docs/ 下
+docs/superpowers/
 
+# ---- 本地部署配置 ----
+/.remote/

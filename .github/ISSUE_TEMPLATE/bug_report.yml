@@ -1,0 +1,132 @@
+name: Bug 反馈
+description: 报告便携启动器的一个 Bug 帮助我们改进
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你提交 Bug 反馈！
+
+        本仓库只负责**便携启动器**（启停、注册、自启、冲突检测、部署与在线更新）。
+        输入法引擎本身的问题（候选、编码、上屏、词库、主题等）请到
+        [WindInput 主仓库](https://github.com/huanfeng/WindInput/issues) 反馈。
+
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 请清晰、简洁地描述你遇到的问题
+      placeholder: 点击「启动」后服务未运行，托盘状态一直显示未启动……
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 请提供能复现此问题的操作步骤
+      placeholder: |
+        1. 把便携包解压到 D:\Apps\WindInput
+        2. 运行 wind_portable.exe
+        3. 点击「启动」并在 UAC 提示中确认
+        4. 状态仍显示未运行
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+      description: 你期望的正确行为是什么？
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+      description: 实际发生了什么？（如有错误对话框，请附上完整文字）
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 启动器版本
+      description: 右键 wind_portable.exe →「属性」→「详细信息」中的文件版本
+      placeholder: "0.0.1-alpha"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: 操作系统
+      options:
+        - Windows 11
+        - Windows 10
+        - 其他（请在描述中说明）
+    validations:
+      required: true
+
+  - type: input
+    id: os-version
+    attributes:
+      label: 系统版本
+      description: 如 Windows 11 24H2
+      placeholder: "Windows 11 24H2"
+
+  - type: dropdown
+    id: source
+    attributes:
+      label: 获取方式
+      options:
+        - WindInput 官方便携版 (Portable.zip)
+        - WindInput 官方安装包 (Setup.exe)
+        - 源码构建
+        - 其他（请在描述中说明）
+    validations:
+      required: true
+
+  - type: input
+    id: location
+    attributes:
+      label: 便携目录位置
+      description: |
+        完整路径。位于 `C:\Program Files`、`C:\Windows` 等受保护目录时行为不同
+        （启动器会切换为复制部署），这对定位问题很关键。
+      placeholder: "D:\\Apps\\WindInput"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: installed-coexist
+    attributes:
+      label: 本机是否装有安装版清风输入法
+      options:
+        - 否
+        - 是
+        - 不确定
+    validations:
+      required: true
+
+  - type: textarea
+    id: status-output
+    attributes:
+      label: "`wind_portable -status` 输出"
+      description: 在便携目录下运行 `wind_portable.exe -status`，粘贴其输出
+      placeholder: "service=stopped mode=conflict reason=\"...\""
+      render: text
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 截图或日志
+      description: |
+        如有截图请在此粘贴。便携版日志位于 `<程序目录>\userdata\logs\`。
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: 其他信息
+      description: 其他你认为有帮助的信息（杀毒软件拦截、组策略限制、非管理员账户等）

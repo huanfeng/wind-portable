@@ -1,0 +1,79 @@
+name: CI
+
+# push/PR 门禁:全程 ubuntu-latest 交叉编译校验(无需 Windows runner)。
+# 与 WindInput 主仓 ci.yml 同构 —— 同一条 cargo-xwin + MSVC SDK 工具链。
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md', 'docs/**']
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TARGET: x86_64-pc-windows-msvc
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 clang-19/lld-19/llvm-19
+        run: sudo apt-get update && sudo apt-get install -y clang-19 lld-19 llvm-19
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - name: 安装 cargo-xwin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-xwin
+
+      # 缓存 MSVC CRT/Windows SDK(xwin 首次下载约数百 MB)
+      - name: 缓存 xwin SDK
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/cargo-xwin
+          key: xwin-${{ runner.os }}-v1
+
+      - uses: Swatinem/rust-cache@v2
+
+      # cargo-xwin 按【无版本号】的名字搜索 clang-cl/lld-link/llvm-rc/llvm-lib/llvm-dlltool,
+      # 而 apt 的 llvm-19 包只提供带版本号的名字。故建一层软链桥把无版本名指向 -19 版本。
+      # 只有 clang-cl 可以指向 clang —— clang 按 argv[0] 进入 cl 兼容模式;
+      # 其余必须指向各自的 llvm 工具,否则参数风格对不上。
+      - name: 桥接 MSVC 交叉编译工具链
+        run: |
+          BIN="$HOME/.local/xwin-bin"
+          mkdir -p "$BIN"
+          ln -sf "$(command -v clang-19)"        "$BIN/clang-cl"
+          ln -sf "$(command -v lld-link-19)"     "$BIN/lld-link"
+          ln -sf "$(command -v llvm-rc-19)"      "$BIN/llvm-rc"
+          ln -sf "$(command -v llvm-lib-19)"     "$BIN/llvm-lib"
+          ln -sf "$(command -v llvm-dlltool-19)" "$BIN/llvm-dlltool"
+          echo "$BIN" >> "$GITHUB_PATH"
+          echo "XWIN_ACCEPT_LICENSE=1" >> "$GITHUB_ENV"
+
+      - name: fmt 检查
+        run: cargo fmt --all -- --check
+
+      # clippy 走 Windows 目标 —— 大部分代码在 cfg(windows) 下,本机目标编不到。
+      - name: clippy (${{ env.TARGET }})
+        run: cargo xwin clippy --target "$TARGET" --all-targets -- -D warnings
+
+      # 纯逻辑单元测试跑在本机目标(变体/布局/CLI/RPC 帧/部署逻辑,均不依赖 Win32)。
+      - name: 单元测试 (host)
+        run: cargo test
+
+      # 链接校验:clippy 只做类型检查不产 exe,链接期错误(如漏开 windows crate feature)
+      # 会溜过门禁。故补一次真实构建。用 dev profile —— release 的 LTO + codegen-units=1
+      # 慢得多,而本仓不产出发布物(便携版由 WindInput 主仓的原生 MSVC 发布链打包),
+      # 这里只需回答"能否链接成功"。
+      - name: 链接校验 (${{ env.TARGET }})
+        run: cargo xwin build --target "$TARGET"
