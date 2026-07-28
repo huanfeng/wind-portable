@@ -191,7 +191,7 @@ mod tests {
         let root = tempdir();
         std::fs::write(root.join("wind_input.exe"), b"x").unwrap();
         std::fs::write(root.join("wind_tsf.dll"), b"x").unwrap();
-        let cfg = detect_from(&v, &[root.clone()]).unwrap();
+        let cfg = detect_from(&v, std::slice::from_ref(&root)).unwrap();
         assert_eq!(cfg.service_exe, root.join("wind_input.exe"));
         assert_eq!(cfg.tsf_dll, Some(root.join("wind_tsf.dll")));
         assert_eq!(cfg.tsf_dll_x86, None);
@@ -207,7 +207,7 @@ mod tests {
         let root = tempdir();
         std::fs::create_dir_all(root.join("build_dev")).unwrap();
         std::fs::write(root.join("build_dev").join("wind_input.exe"), b"x").unwrap();
-        let cfg = detect_from(&v, &[root.clone()]).unwrap();
+        let cfg = detect_from(&v, std::slice::from_ref(&root)).unwrap();
         assert_eq!(
             cfg.service_exe,
             root.join("build_dev").join("wind_input.exe")
@@ -247,7 +247,7 @@ mod tests {
         let v = Variant::new(true);
         let root = tempdir();
         std::fs::write(root.join("wind_input_dev.exe"), b"x").unwrap();
-        let cfg = detect_from(&v, &[root.clone()]).unwrap();
+        let cfg = detect_from(&v, std::slice::from_ref(&root)).unwrap();
         assert_eq!(cfg.service_exe, root.join("wind_input_dev.exe"));
     }
 

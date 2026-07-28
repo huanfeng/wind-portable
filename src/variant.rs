@@ -150,15 +150,15 @@ mod tests {
     fn detect_dev_direct_and_build_subdir() {
         let tmp = tempdir();
         // 无文件 → 发布版。
-        assert!(!detect_dev_in(&[tmp.clone()]));
+        assert!(!detect_dev_in(std::slice::from_ref(&tmp)));
         // 同级直接放 → 开发版。
         std::fs::write(tmp.join("wind_input_dev.exe"), b"x").unwrap();
-        assert!(detect_dev_in(&[tmp.clone()]));
+        assert!(detect_dev_in(std::slice::from_ref(&tmp)));
         std::fs::remove_file(tmp.join("wind_input_dev.exe")).unwrap();
         // build_dev 子目录 → 开发版。
         std::fs::create_dir_all(tmp.join("build_dev")).unwrap();
         std::fs::write(tmp.join("build_dev").join("wind_input_dev.exe"), b"x").unwrap();
-        assert!(detect_dev_in(&[tmp.clone()]));
+        assert!(detect_dev_in(std::slice::from_ref(&tmp)));
     }
 
     /// 极简临时目录（避免引入 tempfile 依赖）：用进程 id + 计数器命名。
