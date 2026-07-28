@@ -34,7 +34,6 @@ const START_CONFIRM_TRIES: u32 = 40; // ×500ms ≈ 20s
 /// 决定隐藏态下托盘菜单反映状态变化的最大额外滞后。
 const TRAY_ENABLE_SYNC: Duration = Duration::from_millis(400);
 
-
 /// 退出流程的跨线程状态。用 Atomic 而非 Signal：确认流程整个跑在后台线程，
 /// 而 Signal 存活于 UI 线程的线程局部 arena，只能在 UI 线程读写。
 #[derive(Default)]
@@ -699,7 +698,11 @@ fn spawn_bg_poller(ui: Ui, mgr: Arc<ServiceManager>, title: String) {
                 was_visible = false;
                 prev = None; // 再次显示时强制推送快照
             }
-            std::thread::sleep(if visible { POLL_INTERVAL } else { IDLE_INTERVAL });
+            std::thread::sleep(if visible {
+                POLL_INTERVAL
+            } else {
+                IDLE_INTERVAL
+            });
         }
     });
 }
@@ -995,7 +998,10 @@ fn build_tray(ui: &Ui) -> Tray {
                 if u_set.desired_enables().2 {
                     u_set.settings_clicked();
                 } else {
-                    ctx.notify(&u_set.title, &u_set.blocked_reason("请先启动服务再打开设置"));
+                    ctx.notify(
+                        &u_set.title,
+                        &u_set.blocked_reason("请先启动服务再打开设置"),
+                    );
                 }
             })
             .enabled(ui.en_settings),
