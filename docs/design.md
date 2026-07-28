@@ -145,6 +145,12 @@ CPU 开销。对一个通常隐藏到托盘、短时操作的小启动器可接�
 
 `build.rs` 用 `winresource`（与 `wind_input` 同款）嵌入图标、版本信息与应用清单。
 
+`res/app.ico` 由主仓 WindInput 的图标转换生成（项目自有素材），含 48×48 / 32×32 / 16×16
+三档 32bpp。
+图标资源 ID 必须钉死为 `1`——windui 的窗口类用 `LoadIcon(hinst, MAKEINTRESOURCE(1))` 取它，
+故 `build.rs` 用 `set_icon_with_id(&ico, "1")` 而非依赖 `set_icon` 的默认 ID。
+同一份 .ico 还会被 `ui/mod.rs` 以 `include_bytes!` 内嵌、经 `ico` crate 解码为 RGBA 供托盘使用。
+
 清单只声明 Common-Controls 6.0.0.0，**故意不声明 dpiAware**——windui 在运行时调
 `SetProcessDpiAwarenessContext(PER_MONITOR_V2)`，而 manifest 中的 DPI 声明优先级更高，
 一旦写上会锁死并使 windui 的运行时设置失效。
