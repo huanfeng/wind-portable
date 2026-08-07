@@ -60,6 +60,11 @@ active 窗口续帧）详见该文档"关键设计"节。
 输入法引擎本身（候选、编码、上屏、词库、主题）的问题请到主仓库
 [WindInput](https://github.com/huanfeng/WindInput/issues) 反馈。
 
+## 安全
+
+启动器会提权注册 TSF、写开机自启并执行在线更新。发现安全问题请勿公开提 Issue，
+改用 GitHub 的私密漏洞报告渠道，详见 [SECURITY.md](SECURITY.md)。
+
 ## 许可证
 
 本项目采用 [MIT 许可证](LICENSE)。
