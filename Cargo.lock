@@ -894,9 +894,9 @@ dependencies = [
 
 [[package]]
 name = "windui"
-version = "0.9.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee8422181ec6e0d0027e165ac18501e28c127431e705f6e30ad2dc0f388f36d1"
+checksum = "443fba9e92b394a7da3f2525fceace182e48796f19800436b3ec1ff17bfda375"
 dependencies = [
  "objc2",
  "objc2-app-kit",
