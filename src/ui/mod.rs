@@ -145,7 +145,58 @@ enum SnapMsg {
     },
 }
 
-/// 共享 UI 状态。
+/// **后台线程可以持有的那一半状态**：清一色 `Arc` 副本与通道，不含任何 `Signal`。
+///
+/// windui 0.12 起 `Signal<T>` 是 `!Send`——它的存储是 UI 线程的线程局部 arena，
+/// 句柄 move 进别的线程后 `set()` 查不到 slot，不 panic 不报错、值直接丢掉。
+/// 本模块的后台线程本来就只碰这里的字段（见 [`Shared::working`] 的注释，那条约定
+/// 从一开始就在），拆成独立结构体是把它从注释升级为编译期约束：现在往 `Ui` 里加
+/// 一个 Signal 不会再意外把某个 `thread::spawn` 拖垮，而往 `Shared` 里加 Signal
+/// 会当场编译失败。
+#[derive(Clone)]
+struct Shared {
+    /// 后台操作进行中的**权威**标志，供非 UI 线程或窗口隐藏时判断。
+    ///
+    /// 不能拿 `Ui::busy` Signal 当真相：它由后台线程经 channel 送回、在 `on_message`
+    /// 里写，而 windui 排空 channel 的 `pump()` 只跑在 `render()` 里——Windows 不给
+    /// 隐藏窗口发 WM_PAINT，`Sender::send` 的 `InvalidateRect` 唤不出帧，于是窗口收进
+    /// 托盘期间做的动作，其 `Done` 会一直躺在队列里，`busy` 永远停在 true（直到窗口
+    /// 再次显示才补上）。曾导致"托盘停服后无法退出，一直提示正在部署/更新"。
+    working: Arc<AtomicBool>,
+    /// 最新快照的权威副本，理由同 `working`：Signal 要等绘制帧才更新，而窗口收进
+    /// 托盘后再无绘制帧，此时托盘菜单是唯一的界面，只能读这里。
+    snap: Arc<Mutex<Snapshot>>,
+    /// 后台线程发回 UI 线程的通道。**跨线程写状态的唯一合法路径**：`Msg: Send`，
+    /// 而 `on_message` 在 UI 线程执行、可以放心写 Signal。
+    tx: Sender<SnapMsg>,
+}
+
+impl Shared {
+    /// 更新权威快照副本（任意线程可调）。
+    fn publish(&self, snap: &Snapshot) {
+        if let Ok(mut g) = self.snap.lock() {
+            *g = snap.clone();
+        }
+    }
+
+    /// 读权威快照副本。
+    fn snapshot(&self) -> Snapshot {
+        self.snap.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// 后台动作收尾：清权威标志，再把最新快照与结果送回 UI 线程。
+    ///
+    /// 顺序要紧：`working` 必须先于 `send` 清掉。`send` 只是入队 + 请求一帧，窗口隐藏
+    /// 时那一帧不会到来（见 [`Shared::working`]），此时唯一还准的就是这个标志。
+    fn finish_action(&self, mgr: &ServiceManager, outcome: Option<String>) {
+        let snap = compute_snapshot(mgr);
+        self.publish(&snap);
+        self.working.store(false, Ordering::SeqCst);
+        let _ = self.tx.send(SnapMsg::Done { snap, outcome });
+    }
+}
+
+/// 共享 UI 状态。**只在 UI 线程持有**（含 `Signal`，见 [`Shared`]）。
 /// Signal<T> 是 Copy 索引句柄，Clone 几乎零开销（仅拷索引与 Arc 引用计数）。
 #[derive(Clone)]
 struct Ui {
@@ -167,21 +218,10 @@ struct Ui {
     en_deploy: Signal<bool>,
     // 后台操作进行中标志（仅供 UI 呈现：忽略轮询快照、置灰按钮）。
     busy: Signal<bool>,
-    // 同一事实的权威副本，供**非 UI 线程或窗口隐藏时**判断。
-    //
-    // 不能拿 `busy` Signal 当真相：它由后台线程经 channel 送回、在 `on_message` 里写，
-    // 而 windui 排空 channel 的 `pump()` 只跑在 `render()` 里（app.rs:1162）——
-    // Windows 不给隐藏窗口发 WM_PAINT，`Sender::send` 的 `InvalidateRect` 唤不出帧，
-    // 于是窗口收进托盘期间做的动作，其 `Done` 会一直躺在队列里，`busy` 永远停在 true
-    // （直到窗口再次显示才补上）。曾导致"托盘停服后无法退出，一直提示正在部署/更新"。
-    working: Arc<AtomicBool>,
-    // 最新快照的权威副本，理由同 `working`：Signal 要等绘制帧才更新，而窗口收进
-    // 托盘后再无绘制帧，此时托盘菜单是唯一的界面，只能读这里。
-    snap: Arc<Mutex<Snapshot>>,
     // 退出流程状态（见 ExitState）。
     exit: Arc<ExitState>,
-    // 后台线程发回 UI 线程的通道
-    tx: Sender<SnapMsg>,
+    // 可交给后台线程的那一半（权威标志/快照 + 回程通道）。
+    shared: Shared,
 }
 
 impl Ui {
@@ -256,7 +296,7 @@ impl Ui {
         // 下一拍就把它改回去，按钮会闪一下。
         self.set_enables(false, false, false, false, false, true);
         self.busy.set(true);
-        self.working.store(true, Ordering::SeqCst);
+        self.shared.working.store(true, Ordering::SeqCst);
     }
 
     /// 已有后台操作在跑时拒绝新的部署，并说明原因。
@@ -265,7 +305,7 @@ impl Ui {
     /// `working` 是无条件写的标志，先完成的那个会替另一个把 busy 清掉，界面提前"解冻"；
     /// 若正在跑的是原地更新，源目录的文件正被替换，此刻复制出去的会是半新半旧的一套。
     fn reject_if_working(&self) -> bool {
-        if !self.working.load(Ordering::SeqCst) {
+        if !self.shared.working.load(Ordering::SeqCst) {
             return false;
         }
         dialog::error(
@@ -274,29 +314,6 @@ impl Ui {
             &self.title,
         );
         true
-    }
-
-    /// 后台动作收尾：清权威标志，再把最新快照与结果送回 UI 线程。
-    ///
-    /// 顺序要紧：`working` 必须先于 `send` 清掉。`send` 只是入队 + 请求一帧，窗口隐藏
-    /// 时那一帧不会到来（见 [`Ui::working`]），此时唯一还准的就是这个标志。
-    fn finish_action(&self, mgr: &ServiceManager, outcome: Option<String>) {
-        let snap = compute_snapshot(mgr);
-        self.publish(&snap);
-        self.working.store(false, Ordering::SeqCst);
-        let _ = self.tx.send(SnapMsg::Done { snap, outcome });
-    }
-
-    /// 更新权威快照副本（任意线程可调）。
-    fn publish(&self, snap: &Snapshot) {
-        if let Ok(mut g) = self.snap.lock() {
-            *g = snap.clone();
-        }
-    }
-
-    /// 读权威快照副本。
-    fn snapshot(&self) -> Snapshot {
-        self.snap.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
     /// 六个按钮的期望启用态 `(start, stop, settings, data, update, deploy)`。
@@ -312,12 +329,12 @@ impl Ui {
         if self.detect_error.is_some() {
             return (false, false, false, false, false, false);
         }
-        let s = self.snapshot();
+        let s = self.shared.snapshot();
         if s.conflict.is_some() {
             // 冲突态只放行"复制/ZIP 部署到其他目录"。
             return (false, false, false, false, false, true);
         }
-        if self.working.load(Ordering::SeqCst) {
+        if self.shared.working.load(Ordering::SeqCst) {
             return (false, false, false, false, false, true);
         }
         let running = s.running;
@@ -353,10 +370,10 @@ impl Ui {
 
     /// 动作不可用时的气泡说明。冲突与"正忙"要说清，否则用户只看到点了没反应。
     fn blocked_reason(&self, default: &str) -> String {
-        if self.working.load(Ordering::SeqCst) {
+        if self.shared.working.load(Ordering::SeqCst) {
             return "正在执行上一个操作，请稍候".into();
         }
-        match self.snapshot().conflict {
+        match self.shared.snapshot().conflict {
             Some(reason) => reason,
             None => default.into(),
         }
@@ -370,7 +387,8 @@ impl Ui {
     fn start_clicked(&self) {
         let Some(mgr) = self.mgr.clone() else { return };
         self.begin_busy("正在启动服务...", "等待服务就绪", "");
-        let this = self.clone();
+        // 只把 Shared 交给线程：Ui 含 Signal（`!Send`），且线程里也不该写 Signal。
+        let sh = self.shared.clone();
         std::thread::spawn(move || {
             let r = mgr.start_service();
             if r.is_ok() {
@@ -381,7 +399,7 @@ impl Ui {
                     std::thread::sleep(Duration::from_millis(500));
                 }
             }
-            this.finish_action(&mgr, r.err().map(|e| e.to_string()));
+            sh.finish_action(&mgr, r.err().map(|e| e.to_string()));
         });
     }
 
@@ -389,10 +407,10 @@ impl Ui {
     fn stop_clicked(&self) {
         let Some(mgr) = self.mgr.clone() else { return };
         self.begin_busy("正在停止服务...", "", "");
-        let this = self.clone();
+        let sh = self.shared.clone();
         std::thread::spawn(move || {
             let r = mgr.stop_service();
-            this.finish_action(&mgr, r.err().map(|e| e.to_string()));
+            sh.finish_action(&mgr, r.err().map(|e| e.to_string()));
         });
     }
 
@@ -426,7 +444,7 @@ impl Ui {
         // 此时探活探到的 running 是**安装版**的服务，不是我们的；启动器本身被禁用、
         // 无任何驻留价值，收进托盘只会让用户以为"关不掉"。confirm_exit 也会因冲突
         // 走直接放行（无残留可清理），这里提前拦下省掉一次无谓的 WM_CLOSE 往返。
-        let snap = self.snapshot();
+        let snap = self.shared.snapshot();
         if snap.conflict.is_some() {
             return true;
         }
@@ -460,9 +478,9 @@ impl Ui {
             return false;
         }
         // 读权威标志而非 `busy` Signal：窗口收在托盘里时 Signal 是陈旧的（见 Ui::working）。
-        let busy = self.working.load(Ordering::SeqCst);
+        let busy = self.shared.working.load(Ordering::SeqCst);
         // 冲突态（已安装版本占用）：启动器未注册未起进程，无副作用可清理，直接放行。
-        let conflict = self.snapshot().conflict.is_some();
+        let conflict = self.shared.snapshot().conflict.is_some();
         // HWND 非 Send，拆成裸整数过线程边界，用时再还原。
         let owner_raw = self.owner().map(|h| h.0 as isize);
         let (title, mgr, exit) = (self.title.clone(), self.mgr.clone(), self.exit.clone());
@@ -557,13 +575,16 @@ impl Ui {
                 "正在停止服务并替换文件",
                 "正在更新：停止服务并替换文件…",
             );
+            // defer_blocking 的闭包仍在 UI 线程（可持有 Ui、可写 Signal），
+            // 但下面这个真正的工作线程只能拿 Shared。
+            let sh = this.shared.clone();
             std::thread::spawn(move || {
                 let outcome = match mgr.update_from_zip(&zip) {
                     Ok(true) => Some("更新完成。启动器自身已更新，请关闭后重新打开。".to_string()),
                     Ok(false) => Some("便携版更新完成。".to_string()),
                     Err(e) => Some(e.to_string()),
                 };
-                this.finish_action(&mgr, outcome);
+                sh.finish_action(&mgr, outcome);
             });
         });
     }
@@ -601,6 +622,7 @@ impl Ui {
                 "正在复制文件到目标目录",
                 "正在复制文件到目标目录…",
             );
+            let sh = this.shared.clone();
             std::thread::spawn(move || {
                 let outcome = match mgr.deploy_to_directory(&target) {
                     Ok(()) => Some(format!(
@@ -609,7 +631,7 @@ impl Ui {
                     )),
                     Err(e) => Some(format!("部署失败：{e}")),
                 };
-                this.finish_action(&mgr, outcome);
+                sh.finish_action(&mgr, outcome);
             });
         });
     }
@@ -654,6 +676,7 @@ impl Ui {
                 "正在解压文件到目标目录",
                 "正在解压文件到目标目录…",
             );
+            let sh = this.shared.clone();
             std::thread::spawn(move || {
                 let outcome = match mgr.deploy_zip_to_directory(&zip, &target) {
                     Ok(()) => Some(format!(
@@ -662,7 +685,7 @@ impl Ui {
                     )),
                     Err(e) => Some(format!("部署失败：{e}")),
                 };
-                this.finish_action(&mgr, outcome);
+                sh.finish_action(&mgr, outcome);
             });
         });
     }
@@ -670,7 +693,9 @@ impl Ui {
 
 /// 后台轮询线程：窗口可见时周期算快照、变化时经 channel 推给 UI 线程；
 /// 隐藏到托盘时**暂停**轮询，仅低频探测可见性，并在刚隐藏那刻回收工作集。
-fn spawn_bg_poller(ui: Ui, mgr: Arc<ServiceManager>, title: String) {
+/// 收 [`Shared`] 而非 `Ui`：轮询线程只读写权威副本、只经 channel 回程，
+/// 从不碰 Signal（0.12 起 `Signal` 是 `!Send`，编译器现在替我们守着这条线）。
+fn spawn_bg_poller(ui: Shared, mgr: Arc<ServiceManager>, title: String) {
     std::thread::spawn(move || {
         let mut prev: Option<Snapshot> = None;
         let mut was_visible = true;
@@ -791,7 +816,9 @@ pub fn run(manager: Option<ServiceManager>, variant: &Variant, detect_error: Opt
     // Signal 是 Copy，闭包直接捕获（无需 clone）。
     let de = detect_error.clone();
     let rd = root_dir.clone();
-    let tx = app.channel::<SnapMsg>(move |msg| {
+    // windui 0.12 起 on_message 收 `&mut EventCtx`（宿主能力通道）。这里只写 Signal，
+    // 用不上 ctx。
+    let tx = app.channel::<SnapMsg>(move |_ctx, msg| {
         let snap = match msg {
             SnapMsg::Poll(snap) => {
                 if busy.get() {
@@ -841,17 +868,19 @@ pub fn run(manager: Option<ServiceManager>, variant: &Variant, detect_error: Opt
         en_update,
         en_deploy,
         busy,
-        working: Arc::new(AtomicBool::new(false)),
-        snap: Arc::new(Mutex::new(Snapshot::default())),
         exit: Arc::new(ExitState::default()),
-        tx,
+        shared: Shared {
+            working: Arc::new(AtomicBool::new(false)),
+            snap: Arc::new(Mutex::new(Snapshot::default())),
+            tx,
+        },
     };
 
     // 初始快照：UI 线程直接写 Signal（无需走 channel），同时填好权威副本——
     // 托盘菜单/关闭拦截在首个轮询周期到来前就可能被触发。
     if let Some(m) = &mgr {
         let snap = compute_snapshot(m);
-        ui.publish(&snap);
+        ui.shared.publish(&snap);
         ui.apply_snapshot(&snap);
     } else if let Some(de) = &detect_error {
         status.set("便携模式不可用".into());
@@ -860,7 +889,7 @@ pub fn run(manager: Option<ServiceManager>, variant: &Variant, detect_error: Opt
 
     // 后台轮询线程（可见时每 600ms，收进托盘后降到 800ms 只维护权威副本）。
     if let Some(m) = mgr {
-        spawn_bg_poller(ui.clone(), m, title.clone());
+        spawn_bg_poller(ui.shared.clone(), m, title.clone());
     }
 
     let tray = build_tray(&ui);
@@ -872,8 +901,10 @@ pub fn run(manager: Option<ServiceManager>, variant: &Variant, detect_error: Opt
     let u_tick = ui.clone();
     app.tray(tray)
         .content(content)
-        .on_interval(TRAY_ENABLE_SYNC, move || u_tick.refresh_enables())
-        .on_close_request(move || u_close.close_clicked())
+        // windui 0.12 起这两个 App 级回调都收 `&mut EventCtx`。本应用的关闭决策全部
+        // 走 Win32 WM_CLOSE 与后台线程（见 Ui::confirm_exit），不借 ctx 的宿主能力。
+        .on_interval(TRAY_ENABLE_SYNC, move |_ctx| u_tick.refresh_enables())
+        .on_close_request(move |_ctx| u_close.close_clicked())
         .run();
 }
 
@@ -1020,7 +1051,9 @@ fn build_content(ui: &Ui) -> Element {
     // `ctx.defer_blocking` 延后执行，不需要的动作直接忽略这个参数即可。
     let action_button = |label: &str, en: Signal<bool>, on: Box<dyn Fn(&mut EventCtx)>| {
         Element::button(label)
-            .enabled(en)
+            // 0.12 的启用轴分三形态：`enabled(bool)` / `enabled_signal(Signal<bool>)` /
+            // `enabled_when(|| ..)`。绑信号必须走 `_signal` 后缀那一支。
+            .enabled_signal(en)
             .weight(1.0)
             .height(30)
             .on_click(move |ctx| on(ctx))
@@ -1036,22 +1069,22 @@ fn build_content(ui: &Ui) -> Element {
         .padding(10)
         .spacing(6)
         .child(
-            // label_rc 绑定 Signal<String>，Signal 变化时自动局部刷新文字。
-            Element::label_rc(ui.status)
+            // label_signal 绑定 Signal<String>，Signal 变化时自动局部刷新文字。
+            Element::label_signal(ui.status)
                 .font_size(16.0)
                 .fg(Color::hex(FG))
                 .height(22)
                 .width_match(),
         )
         .child(
-            Element::label_rc(ui.detail)
+            Element::label_signal(ui.detail)
                 .font_size(13.0)
                 .fg(Color::hex(SUB))
                 .height(40)
                 .width_match(),
         )
         .child(
-            Element::label_rc(ui.dir)
+            Element::label_signal(ui.dir)
                 .font_size(12.0)
                 .fg(Color::hex(SUB))
                 .height(22)
@@ -1117,7 +1150,7 @@ fn build_content(ui: &Ui) -> Element {
         )
         .child(
             // 部署页结果/进度行：只绑 notice，空闲为空白。
-            Element::label_rc(ui.notice)
+            Element::label_signal(ui.notice)
                 .font_size(12.0)
                 .fg(Color::hex(SUB))
                 .width_match()
