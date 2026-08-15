@@ -57,7 +57,7 @@ src/
 ├── deploy.rs         # 便携包部署与在线更新（平台无关，可 Linux 单测）
 ├── dialog.rs         # 文件/目录选择（windui PickDialog）与消息框（MessageBoxW）
 ├── singleton.rs      # 单实例 Mutex + 唤起已有窗口
-└── ui/mod.rs         # windui App + 控件树 + 托盘 + 轮询器
+└── ui/mod.rs         # windui App + 控件树 + 托盘 + 后台轮询线程
 ```
 
 平台无关的纯逻辑（`variant` 常量、`layout` 路径探测、`cli` 解析、`rpc` 帧编解码、
@@ -74,28 +74,43 @@ ACL 授权（ALL_APP_PACKAGES，SID `S-1-15-2-1`）走 `icacls "<dll>" /grant *S
 
 ## 关键设计：UI 实时状态刷新
 
-windui 是单线程 retained 模式：`App` 仅接受 `content(Element)`，**无 app 级帧/idle 回调、
-无定时器、无跨线程唤醒**；`request_repaint()` 是 thread-local；状态绑定 `Rc<RefCell>` 为
-`!Send`，后台线程无法持有。因此不能用"后台线程轮询 + marshal 回 UI"的常规做法。
+> 早期版本（windui 0.4.0 之前）用的是另一套机制：框架当时没有 app 级定时器与跨线程唤醒，
+> 只能挂一个隐藏的 `visible_when` 元素当逐帧钩子、在谓词里同步做 RPC，靠 `request_repaint()`
+> 续帧。代价是窗口可见时按帧率重绘静态窗口。框架补上 `App::channel` 与 `App::on_interval`
+> 之后已整体换成下面这套，本节描述的是当前实现。
 
-**采用的机制（不改 windui）**：
+windui 仍是单线程 retained 模式，但状态刷新不再需要绕道逐帧钩子：
 
-- 反应式状态用 windui 自带绑定：状态文字 `label_rc(Rc<RefCell<String>>)`；每个按钮
-  `enabled(Rc<Cell<bool>>)` 运行期启停。
-- 一个隐藏的"轮询器"元素 `Element::leaf().visible_when(closure)`。其谓词在每帧
-  layout/paint 遍历时于 **UI 线程**被调用——这是逐帧钩子。谓词内按 `Instant` 节流
-  （稳态约 1s，操作后冷却期约 300ms 持续约 15s），到点则做一次**同步刷新**
-  （RPC `system.status` + 注册表冲突/注册态 + 部署源探测，均为毫秒级），把结果写入绑定状态；
-  只要处于"活跃轮询窗口"且窗口可见，就 `anim::request_repaint()` 续帧。
-- 续帧门控：托盘隐藏/显示翻转 `Rc<Cell<bool>>` 可见标志；隐藏时谓词不再续帧 →
-  事件循环回到 `GetMessageW` 阻塞、零 CPU；显示时由 WM_PAINT 重启循环。
+- **状态载体是 `Signal<T>`**：Copy 的索引句柄，值存在 **UI 线程的线程局部 arena**。
+  `Signal::set()` 自动标记脏区，框架据此局部重绘，无需手工 `mark_dirty()`。
+  文字绑 `Element::label_signal(Signal<String>)`，按钮启停绑 `.enabled_signal(Signal<bool>)`。
+  自 windui 0.12 起 `Signal<T>` 是 `!Send`——句柄 move 进别的线程后 `set()` 查不到 slot，
+  会静默丢值，故该约束由编译器强制（见下方 `Shared` 拆分）。
+- **后台轮询线程做全部阻塞 I/O**（RPC 探活 + 注册表读取 + 冲突检测），算出 `Snapshot`
+  后经 `App::channel` 的 `Sender<SnapMsg>` 送回；`on_message` 在 UI 线程执行，
+  在那里写 Signal。间隔：窗口可见 600ms，收进托盘 800ms。
+- **UI 线程只写 Signal，不做任何 I/O**。需要阻塞式原生对话框的动作（选 ZIP/选目录/确认框、
+  部署与更新）走 `ctx.defer_blocking(f)`：直接在 `on_click` 里同步弹模态框会在 OS 鼠标捕获
+  尚未释放时重入对话框的消息泵，反复几次就把鼠标锁死。真正的耗时工作再从那里丢给工作线程。
 
-**已知取舍**：窗口可见且处于活跃轮询窗口期间，按帧率（≤60fps）重绘静态窗口，有少量
-CPU 开销。对一个通常隐藏到托盘、短时操作的小启动器可接受；稳态（无操作约 15s 后）回到
-事件驱动 + 零空闲。同步 RPC 在服务启动瞬间极端情况下可能有一次 ≤200ms 卡顿（管道存在
-但 busy），罕见且短暂；RPC 超时设 200ms 上限。
+**状态存两份，这是刻意的**：Signal（供界面呈现）之外，另有一份 `Arc` 权威副本
+（`Shared { working, snap, tx }`）。原因是 windui 排空 channel 的 `pump()` 只跑在 `render()`
+里，而 Windows 不给隐藏窗口发 `WM_PAINT`——`Sender::send` 的 `InvalidateRect` 唤不出帧。
+于是窗口收进托盘期间做的动作，其 `Done` 消息会一直躺在队列里，Signal 停在收起那刻。
+凡是**非 UI 线程或窗口隐藏时**要判断的地方（托盘菜单点击校验、关闭拦截、拒绝并发部署）
+一律读权威副本，不读 Signal。曾因读错来源导致"托盘停服后无法退出，一直提示正在部署/更新"。
 
-隐藏态下托盘菜单项的启停状态不依赖绘制帧（隐藏窗口收不到 WM_PAINT），另有独立的同步路径。
+`Shared` 与 `Ui` 的拆分即由此而来：后台线程只拿 `Shared`（清一色 `Arc` 与通道，无 Signal），
+`Ui` 含 Signal、只在 UI 线程持有。0.12 的 `!Send` 把这条原本写在注释里的约定变成了编译期约束。
+
+**托盘菜单的启停不依赖绘制帧**：`App::on_interval(400ms)` 走平台定时器（WM_TIMER 在隐藏态
+照常触发），在 UI 线程把权威快照重算成六个 `en_*` Signal，菜单弹出时实时读它们决定灰显。
+写入前**必须先比较**（`set_if`）：`Signal::set` 不去重，无条件写会让可见态每个定时器拍都请求
+重绘，空闲 CPU 回不到 0。菜单项的点击回调另用权威副本再校验一次并给气泡提示——定时器最长
+滞后一拍，兜底防误触发。
+
+**空闲开销**：稳态下事件循环阻塞在 `GetMessageW`，无帧、零 CPU。隐藏到托盘那一刻还会
+`EmptyWorkingSet` 回收一次工作集。RPC 超时上限 200ms，且全部发生在后台线程，不阻塞 UI。
 
 ## 运行流程
 
@@ -104,13 +119,28 @@ CPU 开销。对一个通常隐藏到托盘、短时操作的小启动器可接�
   非 UI → stderr 报错 + exit 1。
 - **GUI 路径**：占用单实例 Mutex；占用失败 → 找到首实例窗口并前置后退出（后启动者本就持有
   用户输入前台权限，`SetForegroundWindow` 可靠生效，无需事件 + 等待线程，规避 windui
-  单线程模型下的跨线程唤醒难题）；否则建窗口 + 托盘，启动轮询器，首帧即触发一次刷新。
+  单线程模型下的跨线程唤醒难题）；否则分配 Signal、注册 channel、在 UI 线程直接写一次初始
+  快照（托盘菜单与关闭拦截可能早于首个轮询周期被触发），再建窗口 + 托盘并起后台轮询线程。
 - **start**：冲突检查 → 建 userdata 目录树 + marker → 若未注册则 `register()`（管理员则直接
   regsvr32 + InstallLayoutOrTip + icacls；否则 `ShellExecuteEx runas` 自我重启并带
   `-elevate-register`）→ 写自启注册表 → 启动 service 进程（隐藏窗口）。
 - **stop**：写 stopped marker → 先试 RPC shutdown（当前必失败→忽略）→ 回退终止 service 进程 →
   删自启注册表 → 若已注册则 `unregister()`。
-- **退出（托盘）**：若服务运行/已注册，确认后异步停止服务再退出进程；否则直接退出。
+- **关闭与退出**：标题栏 × 与托盘「退出」是同一条消息（`WM_CLOSE`），靠 `ExitState::intent`
+  标记区分意图，统一由 `App::on_close_request` 拦截：
+  - **标题栏 × / ESC**：服务在跑 → **收进托盘**（`ShowWindow(SW_HIDE)` 后返回 `false` 取消关闭）。
+    输入法的「关闭」几乎总是"我看完了，收起来"而非"把输入法卸了"，后者代价大且不可逆
+    （要重新注册 TSF）。服务没在跑时窗口已无常驻价值，转入退出流程。冲突态（已安装版占用）
+    直接退出——此时启动器本身被禁用，收进托盘只会让人以为关不掉。
+  - **托盘「退出」**：置 `intent` 后投递 `WM_CLOSE`，汇入同一条拦截链。**不能用 `TrayCtx::quit()`**：
+    它直接 `DestroyWindow`，绕过 `WM_CLOSE`，卸载确认会被整个跳过。
+  - **卸载确认跑在后台线程**：`on_close_request` 由 WndProc 在持有窗口状态可变借用的临界区里
+    调用，而 `MessageBoxW`/`TaskDialogIndirect` 自带嵌套消息泵——泵到 `WM_PAINT` 就会重入
+    WndProc 再取一次同一份状态（裸指针别名 UB）。因此本次调用只读非阻塞状态并立即返回 `false`，
+    弹框（TaskDialog 命令链接三态：停服并卸载 / 仅关启动器 / 取消）、探活与停服全部丢给后台线程；
+    线程拿到结果后置 `allowed` 并**重新投递 `WM_CLOSE`**，拦截器第二次进来在开头直接放行。
+    `asking` 闸门防止确认框叠弹（拦截器返回 `false` 只取消当次关闭，不阻止用户再点一次）。
+    停服可能触发 UAC，这也是它必须在后台线程的另一个理由。
 
 ## 冲突检测
 

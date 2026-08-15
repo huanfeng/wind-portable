@@ -26,7 +26,8 @@ const ACCENT: u32 = 0x4C8BF5;
 
 /// 窗口可见时后台轮询间隔。
 const POLL_INTERVAL: Duration = Duration::from_millis(600);
-/// 隐藏到托盘时的空闲间隔：不做 RPC/注册表轮询。
+/// 隐藏到托盘时的空闲间隔：仍照常算快照维护权威副本（托盘菜单此刻是唯一的界面，
+/// 停摆会让菜单项卡在收起那刻的状态），只是放慢节奏、且不再推给 UI（没有绘制帧）。
 const IDLE_INTERVAL: Duration = Duration::from_millis(800);
 /// 启动后确认"就绪"的最长等待。
 const START_CONFIRM_TRIES: u32 = 40; // ×500ms ≈ 20s
