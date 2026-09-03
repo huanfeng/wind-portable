@@ -54,8 +54,10 @@ pub fn read_string(root: HKEY, subkey: &str, value: &str) -> Option<String> {
         // 奇数字节数时丢弃末尾半个 u16（n*2 <= cb2，切片必在界内）。
         let n = (cb2 as usize) / 2;
         let u16s: Vec<u16> = buf[..n * 2]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         let s = String::from_utf16_lossy(&u16s);
         Some(s.trim_end_matches('\0').to_string())

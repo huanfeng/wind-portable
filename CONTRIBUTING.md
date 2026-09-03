@@ -92,7 +92,7 @@ Windows 副作用无法在 CI 中验证**，涉及这些路径的改动请在 Wi
 
 ### Git Hooks（首次克隆后建议激活）
 
-仓库自带 `.githooks/pre-commit`（提交前自动跑 `cargo fmt --check`，避免未格式化代码被提交后才在 CI 里暴露），默认不生效，需一次性激活：
+仓库自带 `.githooks/pre-commit`（提交前自动跑 `cargo fmt --check` 与 `cargo clippy --all-targets -- -D warnings`，避免未格式化代码或 clippy 报错被提交后才在 CI 里暴露），默认不生效，需一次性激活：
 
 ```bash
 git config core.hooksPath .githooks
