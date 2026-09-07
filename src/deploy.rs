@@ -51,6 +51,10 @@ pub fn deploy_from_zip(zip_path: &Path, target_dir: &Path) -> Result<bool> {
     let file = fs::File::open(zip_path).map_err(|e| anyhow!("打开 ZIP 失败: {e}"))?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| anyhow!("读取 ZIP 失败: {e}"))?;
 
+    // 先整体扫一遍定出要剥掉的公共顶层目录（判据见 [`common_root_dir`]）。必须在解压
+    // 循环之前算完——循环里 by_index 会借用 zip。
+    let strip = common_root_dir(&mut zip)?;
+
     for i in 0..zip.len() {
         let mut entry = zip
             .by_index(i)
@@ -62,6 +66,13 @@ pub fn deploy_from_zip(zip_path: &Path, target_dir: &Path) -> Result<bool> {
         let rel = entry
             .enclosed_name()
             .ok_or_else(|| anyhow!("ZIP 含非法条目路径"))?;
+        let rel = match &strip {
+            Some(top) => rel.strip_prefix(top).unwrap_or(&rel).to_path_buf(),
+            None => rel,
+        };
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
         let dst = target_dir.join(&rel);
         if let Some(parent) = dst.parent() {
             fs::create_dir_all(parent).map_err(|e| anyhow!("创建目录失败: {e}"))?;
@@ -163,6 +174,48 @@ fn extract_to<R: Read>(entry: &mut R, dst: &Path) -> io::Result<()> {
     let mut out = fs::File::create(dst)?;
     io::copy(entry, &mut out)?;
     Ok(())
+}
+
+/// ZIP 内所有文件是否共享同一个顶层目录；是则返回该目录名，供解压时剥掉。
+///
+/// 便携包有两种形状都得能更新：文件直接放在根（解压即用），或统一裹一层版本目录
+/// （`WindInput-Portable-0.120/…`）。后者若原样解压，会在便携目录里再解出一层子目录，
+/// 当前文件一个都没更新——这正是「更新当前版本」的故障现象。
+///
+/// ⚠️ [`validate_zip`] 只按 `file_name` 匹配、对层级无感，带顶层目录的包照样通过校验，
+/// 所以层级这件事**只能在解压侧处理**。两处对 ZIP 形状的假设必须一起看。
+///
+/// 判据从严，只在能确定时才剥：根部一旦直接有文件，或顶层目录不止一个，都返回 `None`
+/// ——剥错了会把根部文件丢掉，比不剥更糟。
+fn common_root_dir<R: std::io::Read + std::io::Seek>(
+    zip: &mut zip::ZipArchive<R>,
+) -> Result<Option<String>> {
+    let mut root: Option<String> = None;
+    for i in 0..zip.len() {
+        let entry = zip
+            .by_index(i)
+            .map_err(|e| anyhow!("读取 ZIP 条目失败: {e}"))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.enclosed_name() else {
+            continue;
+        };
+        let mut comps = name.components();
+        let Some(first) = comps.next() else {
+            continue;
+        };
+        if comps.next().is_none() {
+            return Ok(None); // 根部直接有文件 → 整个包就是「解压即用」的形状
+        }
+        let top = first.as_os_str().to_string_lossy().to_string();
+        match &root {
+            None => root = Some(top),
+            Some(r) if *r == top => {}
+            Some(_) => return Ok(None), // 顶层不止一个 → 无公共前缀可剥
+        }
+    }
+    Ok(root)
 }
 
 /// `<path>.<kind>_<纳秒>`（kind = old/new）：避免与现存文件冲突（不依赖随机数）。
@@ -320,5 +373,75 @@ mod tests {
         assert!(!needs_restart); // 测试进程 exe 不在包内
         assert!(target.join("wind_input.exe").is_file());
         assert!(target.join("data").join("config.toml").is_file());
+    }
+
+    /// 写一个 ZIP，条目名按给定清单。
+    fn write_zip(path: &Path, names: &[&str]) {
+        use std::io::Write;
+        let f = fs::File::create(path).unwrap();
+        let mut w = zip::ZipWriter::new(f);
+        let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default();
+        for name in names {
+            w.start_file(*name, opts).unwrap();
+            w.write_all(b"content").unwrap();
+        }
+        w.finish().unwrap();
+    }
+
+    /// 回归：整包裹了一层版本目录时，必须剥掉后再落地。
+    ///
+    /// 曾经的故障：`validate_zip` 只按 file_name 匹配、放行了这种包，`deploy_from_zip`
+    /// 却原样保留层级，于是「更新当前版本」在便携目录里又解出一层子目录，
+    /// 当前文件一个都没更新。
+    #[test]
+    fn deploy_from_zip_strips_common_root_dir() {
+        let d = tempdir();
+        let zip_path = d.join("wrapped.zip");
+        write_zip(
+            &zip_path,
+            &[
+                "WindInput-Portable-0.120/wind_input.exe",
+                "WindInput-Portable-0.120/wind_tsf.dll",
+                "WindInput-Portable-0.120/data/config.toml",
+            ],
+        );
+
+        // 带顶层目录的包同样通过校验（校验对层级无感）——所以剥离只能由解压侧负责。
+        validate_zip(&zip_path, &Variant::new(false)).unwrap();
+
+        let target = tempdir();
+        deploy_from_zip(&zip_path, &target).unwrap();
+        assert!(target.join("wind_input.exe").is_file(), "顶层目录未被剥掉");
+        assert!(target.join("data").join("config.toml").is_file());
+        assert!(
+            !target.join("WindInput-Portable-0.120").exists(),
+            "不应再解出一层子目录"
+        );
+    }
+
+    /// 根部直接有文件时不许剥——剥了会把根部文件丢掉，比不剥更糟。
+    #[test]
+    fn deploy_from_zip_keeps_layout_when_root_has_files() {
+        let d = tempdir();
+        let zip_path = d.join("mixed.zip");
+        write_zip(&zip_path, &["wind_input.exe", "data/config.toml"]);
+
+        let target = tempdir();
+        deploy_from_zip(&zip_path, &target).unwrap();
+        assert!(target.join("wind_input.exe").is_file());
+        assert!(target.join("data").join("config.toml").is_file());
+    }
+
+    /// 顶层不止一个目录时也不剥（无公共前缀可言）。
+    #[test]
+    fn deploy_from_zip_keeps_layout_when_multiple_top_dirs() {
+        let d = tempdir();
+        let zip_path = d.join("multi.zip");
+        write_zip(&zip_path, &["a/one.txt", "b/two.txt"]);
+
+        let target = tempdir();
+        deploy_from_zip(&zip_path, &target).unwrap();
+        assert!(target.join("a").join("one.txt").is_file());
+        assert!(target.join("b").join("two.txt").is_file());
     }
 }
