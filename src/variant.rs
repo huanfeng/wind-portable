@@ -38,6 +38,22 @@ pub const SYSTEM_DEPLOY_MARKER_NAME: &str = "system_deploy";
 pub fn has_system_deploy_marker_in(dir: &Path) -> bool {
     dir.join(SYSTEM_DEPLOY_MARKER_NAME).is_file()
 }
+
+/// 写入/清除系统目录部署开关（[`has_system_deploy_marker_in`] 的写侧）。
+///
+/// 开关的持久化就是这个文件本身的存在与否——重启启动器后由 `layout::detect` 读回，
+/// 界面复选框的「记忆」由此而来，不另存配置。关闭时文件不存在即视为成功（幂等）。
+pub fn set_system_deploy_marker(dir: &Path, on: bool) -> std::io::Result<()> {
+    let path = dir.join(SYSTEM_DEPLOY_MARKER_NAME);
+    if on {
+        // 内容仅供人查看；判据是文件存在与否，不解析内容。
+        std::fs::write(&path, "system_deploy=1\n")
+    } else if path.exists() {
+        std::fs::remove_file(&path)
+    } else {
+        Ok(())
+    }
+}
 /// 便携数据目录名（相对便携包根目录）。
 pub const PORTABLE_DATA_DIR: &str = "userdata";
 

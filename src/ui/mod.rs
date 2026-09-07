@@ -8,6 +8,7 @@
 //! - 启停/部署/更新在后台线程跑 `Arc<ServiceManager>`；完成时发 `SnapMsg::Done`，
 //!   最新快照与可选结果行一起写回 UI。
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,7 +18,7 @@ use windui::prelude::*;
 
 use crate::service::ServiceManager;
 use crate::variant::Variant;
-use crate::{deploy, dialog, layout};
+use crate::{deploy, dialog, layout, variant};
 
 const CARD: u32 = 0xFFFFFF;
 const FG: u32 = 0x2D3436;
@@ -217,6 +218,9 @@ struct Ui {
     en_data: Signal<bool>,
     en_update: Signal<bool>,
     en_deploy: Signal<bool>,
+    // 「部署到系统目录」开关。初值由 layout::detect 从 system_deploy 标记文件读出，
+    // 翻转时写回该文件——持久化即文件本身，不另存配置。
+    sys_deploy: Signal<bool>,
     // 后台操作进行中标志（仅供 UI 呈现：忽略轮询快照、置灰按钮）。
     busy: Signal<bool>,
     // 退出流程状态（见 ExitState）。
@@ -544,6 +548,30 @@ impl Ui {
         }
     }
 
+    /// 切换「部署到系统目录」。
+    ///
+    /// ⚠️ 挂在 `on_toggle` 上是**受控模式**：CheckBox 不再自动翻转绑定的 Signal，
+    /// 必须在这里自己 `set`——忘了的话框点了不打勾、且没有任何报错。
+    /// 这里正好要「写盘成功才勾上」，与受控语义天然吻合。
+    ///
+    /// 只改开关不动注册：TSF 注册要管理员权限，静默提权会很突兀。下次
+    /// 停止→启动服务时 `register_direct` 读新值生效，提示里说明这一点。
+    fn system_deploy_toggled(&self) {
+        let want = !self.sys_deploy.get();
+        match variant::set_system_deploy_marker(Path::new(&self.root_dir), want) {
+            Ok(()) => {
+                self.sys_deploy.set(want);
+                self.notice.set(if want {
+                    "已开启：停止服务后重新启动生效。注意与安装版共用系统副本，同机共存时会互相覆盖。".into()
+                } else {
+                    "已关闭（就地注册）：停止服务后重新启动生效。".into()
+                });
+            }
+            // 写盘失败就不翻转，界面保持原状——避免「界面勾上了、磁盘没变」的假成功。
+            Err(e) => self.notice.set(format!("写入开关失败：{e}")),
+        }
+    }
+
     /// 在线更新：选 ZIP → 校验 → 确认 → 后台停服/替换/重启。
     ///
     /// 整段"选文件→校验→确认"都是阻塞式原生模态调用（`PickDialog`/`MessageBoxW`），
@@ -805,6 +833,9 @@ pub fn run(manager: Option<ServiceManager>, variant: &Variant, detect_error: Opt
     let en_data: Signal<bool> = signal(false);
     let en_update: Signal<bool> = signal(false);
     let en_deploy: Signal<bool> = signal(false);
+    // 「部署到系统目录」的初值＝便携目录里 system_deploy 标记是否存在（detect 已读入 cfg）。
+    // 复选框的「记忆」由此而来：每次启动都从磁盘读回，不依赖任何进程内状态。
+    let sys_deploy: Signal<bool> = signal(mgr.as_ref().is_some_and(|m| m.cfg.system_deploy));
     let busy: Signal<bool> = signal(false);
 
     // resizable(false)：去掉 WS_THICKFRAME 与最大化按钮，窗口尺寸固定。
@@ -868,6 +899,7 @@ pub fn run(manager: Option<ServiceManager>, variant: &Variant, detect_error: Opt
         en_data,
         en_update,
         en_deploy,
+        sys_deploy,
         busy,
         exit: Arc::new(ExitState::default()),
         shared: Shared {
@@ -1063,6 +1095,7 @@ fn build_content(ui: &Ui) -> Element {
 
     let (u_start, u_stop, u_set, u_data) = (ui.clone(), ui.clone(), ui.clone(), ui.clone());
     let (u_update, u_dcopy, u_dzip) = (ui.clone(), ui.clone(), ui.clone());
+    let u_sysdep = ui.clone();
 
     // 「运行」页：状态/详情/目录 + 启停/设置/数据（对应原 C# tabRun）。
     let run_page = Element::col()
@@ -1148,6 +1181,12 @@ fn build_content(ui: &Ui) -> Element {
                     ui.en_deploy,
                     Box::new(move |ctx| u_dzip.deploy_zip_clicked(ctx)),
                 )),
+        )
+        .child(
+            // 受控复选框：翻转由 system_deploy_toggled 在写盘成功后自己做（见该方法注释）。
+            Element::checkbox("部署到系统目录（游戏内输入所需）", ui.sys_deploy)
+                .on_toggle(move |_| u_sysdep.system_deploy_toggled())
+                .width_match(),
         )
         .child(
             // 部署页结果/进度行：只绑 notice，空闲为空白。
