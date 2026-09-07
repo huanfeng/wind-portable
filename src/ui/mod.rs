@@ -1184,7 +1184,7 @@ fn build_content(ui: &Ui) -> Element {
         )
         .child(
             // 受控复选框：翻转由 system_deploy_toggled 在写盘成功后自己做（见该方法注释）。
-            Element::checkbox("部署到系统目录（游戏内输入所需）", ui.sys_deploy)
+            Element::checkbox("部署DLL到系统目录（提高游戏兼容性）", ui.sys_deploy)
                 .on_toggle(move |_| u_sysdep.system_deploy_toggled())
                 .width_match(),
         )

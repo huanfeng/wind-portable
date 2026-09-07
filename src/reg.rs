@@ -3,8 +3,8 @@
 
 use windows::core::PCWSTR;
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY, KEY_READ,
-    KEY_SET_VALUE, REG_EXPAND_SZ, REG_SZ, REG_VALUE_TYPE,
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+    HKEY, KEY_READ, KEY_SET_VALUE, REG_EXPAND_SZ, REG_OPTION_NON_VOLATILE, REG_SZ, REG_VALUE_TYPE,
 };
 
 pub use windows::Win32::System::Registry::{
@@ -73,7 +73,24 @@ pub fn set_string(root: HKEY, subkey: &str, value: &str, data: &str) -> bool {
         unsafe { std::slice::from_raw_parts(data_w.as_ptr() as *const u8, data_w.len() * 2) };
     unsafe {
         let mut hkey = HKEY::default();
-        if RegOpenKeyExW(root, PCWSTR(sub.as_ptr()), None, KEY_SET_VALUE, &mut hkey).is_err() {
+        // ⚠️ 用 Create 而非 Open：键不存在时一并建出来。
+        // 曾用 `RegOpenKeyExW`，于是 `Software\<app>` 被上一次卸载整键删掉后，写
+        // InstallDir 会静默返回 false —— 上层把它报成「需要管理员权限」，而实际早已提权，
+        // 诊断方向被带偏。写值的语义本就该保证键存在。
+        // 对已存在的键（如 HKCU 的 Run）Create 等同于 Open，现有调用点行为不变。
+        if RegCreateKeyExW(
+            root,
+            PCWSTR(sub.as_ptr()),
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut hkey,
+            None,
+        )
+        .is_err()
+        {
             return false;
         }
         let r = RegSetValueExW(hkey, PCWSTR(val.as_ptr()), None, REG_SZ, Some(bytes));

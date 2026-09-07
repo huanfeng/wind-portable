@@ -167,7 +167,13 @@ pub fn register_direct(cfg: &PortableConfig, variant: &Variant) -> Result<()> {
             "InstallDir",
             &cfg.root_dir.to_string_lossy(),
         ) {
-            bail!("写入 InstallDir 失败（需要管理员权限）");
+            // ⛔ 别再写成「需要管理员权限」：走到这里必然已经提权过了，那句话会把排查
+            // 引向权限，而真实原因是键写不进去（曾因 set_string 用 Open 语义、而
+            // `Software\<app>` 被上一次卸载整键删掉而失败，白绕一大圈）。
+            bail!(
+                "写入 InstallDir 失败：HKLM\\{} 不可写",
+                app_reg_subkey(variant)
+            );
         }
 
         deploy_and_register(dll, &system_dll_path(variant, false), false)?;
