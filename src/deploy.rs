@@ -166,7 +166,10 @@ fn extract_to<R: Read>(entry: &mut R, dst: &Path) -> io::Result<()> {
 }
 
 /// `<path>.<kind>_<纳秒>`（kind = old/new）：避免与现存文件冲突（不依赖随机数）。
-fn suffix_name(p: &Path, kind: &str) -> PathBuf {
+///
+/// ⚠️ 后缀必须每次唯一：NTFS 允许改名一个**在用**文件，却不允许改名去**覆盖**一个在用
+/// 文件——固定的 `.old` 槽在上一轮残留仍被加载时会让改名直接失败。
+pub(crate) fn suffix_name(p: &Path, kind: &str) -> PathBuf {
     let n = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())

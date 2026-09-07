@@ -96,13 +96,42 @@ fn registered_install_dir(variant: &Variant) -> Option<String> {
 /// 授权与注册都针对系统副本：`DllRegisterServer` 用 `GetModuleFileName` 取被加载模块
 /// 的路径写进 `InprocServer32`，对哪个副本跑 regsvr32 就指向哪个副本。
 fn deploy_and_register(src: &Path, dst: &Path, x86: bool) -> Result<()> {
+    copy_to_system_dir(src, dst)?;
+    grant_app_packages_access(dst);
+    regsvr32(dst, x86, false)
+}
+
+/// 复制到系统目录；旧副本被加载锁住时改名让路再复制。
+///
+/// ⚠️ **必须让路，不能直接 `fs::copy` 了事**：TSF DLL 是 in-proc 常驻的，系统目录里的
+/// 旧副本只要还有宿主进程加载着就无法覆盖（NTFS 允许改名在用文件，却不允许覆盖它）
+/// ——宿主不重启就一直锁着旧代，这是**常态而非异常**。
+///
+/// 曾漏过一次：安装器（`copy_to_system_dir`）与 `dev.ps1`（`Copy-Replace`）都有同款
+/// 让路，唯独便携这条路径直接用了 `fs::copy`，一撞上就整个注册失败，而用户看到的
+/// 只是提权子进程的退出码 → 报「提权失败」，指向完全错误的方向。
+fn copy_to_system_dir(src: &Path, dst: &Path) -> Result<()> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow!("创建系统目录失败 {}: {e}", parent.display()))?;
+        // 顺带收掉历次让路的残留（`*.old_<纳秒>`），否则系统目录里会一直累积。
+        crate::deploy::clean_old_files(parent);
     }
-    std::fs::copy(src, dst).map_err(|e| anyhow!("复制到系统目录失败 {}: {e}", dst.display()))?;
-    grant_app_packages_access(dst);
-    regsvr32(dst, x86, false)
+
+    let Err(first) = std::fs::copy(src, dst) else {
+        return Ok(());
+    };
+    if !dst.exists() {
+        // 目标不存在却失败 → 不是被占用，是权限/磁盘一类的真错误，原样上报。
+        return Err(anyhow!("复制到系统目录失败 {}: {first}", dst.display()));
+    }
+
+    let stash = crate::deploy::suffix_name(dst, "old");
+    std::fs::rename(dst, &stash)
+        .map_err(|e| anyhow!("旧副本被锁定且改名让路失败 {}: {e}", dst.display()))?;
+    std::fs::copy(src, dst)
+        .map(|_| ())
+        .map_err(|e| anyhow!("让路后复制仍失败 {}: {e}", dst.display()))
 }
 
 /// 系统目录里那份副本是不是**本便携实例**部署的。
