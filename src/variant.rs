@@ -20,6 +20,24 @@ pub const LEGACY_PORTABLE_MARKER_NAME: &str = "wind_portable_mode";
 pub fn has_portable_marker_in(dir: &Path) -> bool {
     dir.join(PORTABLE_MARKER_NAME).is_file() || dir.join(LEGACY_PORTABLE_MARKER_NAME).is_file()
 }
+
+/// 系统目录部署的开关标记（放在便携包根目录）。**存在即开启，缺省关闭。**
+///
+/// 关闭（默认）时便携版就地注册，完全不碰 `System32\IME\` 与
+/// `HKLM\Software\<app>\InstallDir`——这两处是**与安装版共用的落点**，同一台机器上
+/// 两者一起用时会互相覆盖。默认就地即零冲突。
+///
+/// 开启后 TSF DLL 才复制进系统目录，代价是与安装版争用同一份系统副本；
+/// 换来的是 Trusted Mode 游戏（CS2 等）里能用——它们只放行系统目录下的 in-proc DLL。
+///
+/// ⚠️ 刻意**不写进 [`PORTABLE_MARKER_NAME`] 文件**：那个文件由 `write_marker` 整体重写
+/// （`wind_portable=1` + 可选 `stopped=1`），塞进去的键会被静默清掉。
+pub const SYSTEM_DEPLOY_MARKER_NAME: &str = "system_deploy";
+
+/// 目录内是否开启了系统目录部署。
+pub fn has_system_deploy_marker_in(dir: &Path) -> bool {
+    dir.join(SYSTEM_DEPLOY_MARKER_NAME).is_file()
+}
 /// 便携数据目录名（相对便携包根目录）。
 pub const PORTABLE_DATA_DIR: &str = "userdata";
 

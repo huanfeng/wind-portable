@@ -33,6 +33,18 @@ wind_portable -ui             # 强制 GUI（即使带了其他动作）
 # 内部（由 UAC 提权自我拉起）：-elevate-register / -elevate-unregister
 ```
 
+## 游戏兼容：`system_deploy` 标记（默认关）
+
+在便携包根目录建一个空文件 `system_deploy`，下次注册时 TSF DLL 会复制进
+`%WINDIR%\System32\IME\<产品名>\`（x86 到 `SysWOW64\...`）并对系统副本注册；
+删掉该文件再重新注册即恢复就地部署。改动开关后需要 `-stop` 再 `-start` 才生效。
+
+**为什么默认关**：`System32\IME\` 与 `HKLM\Software\<产品名>\InstallDir` 是**与安装版
+共用的落点**，同一台机器上便携版与安装版都开着时会互相覆盖。默认就地部署零冲突。
+
+**什么时候需要开**：开启 Trusted Mode 的游戏（CS2 等）只放行系统目录下的 in-proc DLL，
+就地部署的 DLL 连加载都会被拒。注意该判据同时要求 DLL 已代码签名，两个条件缺一不可。
+
 ## 与新 Rust 服务的契约
 
 - 存活探测：RPC `system.status`（无 `System.Ping`）。

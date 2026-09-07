@@ -27,6 +27,9 @@ pub struct PortableConfig {
     pub tsf_dll: Option<PathBuf>,
     /// TSF x86 DLL 路径（不存在则 None）。
     pub tsf_dll_x86: Option<PathBuf>,
+    /// 是否把 TSF DLL 部署进系统目录（`system_deploy` 标记存在即开启，**默认关**）。
+    /// 见 [`crate::variant::SYSTEM_DEPLOY_MARKER_NAME`]。
+    pub system_deploy: bool,
     /// 托盘/窗口图标路径（不存在则 None）。第二阶段接入真实 .ico 图标时使用；
     /// 当前托盘用纯色图标。
     #[allow(dead_code)]
@@ -73,6 +76,7 @@ pub fn detect_from(variant: &Variant, candidates: &[PathBuf]) -> Result<Portable
             setting_exe: setting,
             tsf_dll,
             tsf_dll_x86,
+            system_deploy: variant::has_system_deploy_marker_in(root),
             icon_path,
         });
     }
@@ -199,6 +203,28 @@ mod tests {
         assert_eq!(cfg.portable_marker, root.join("portable_mode"));
         // setting 不存在 → 取约定位置。
         assert_eq!(cfg.setting_exe, root.join("wind_setting.exe"));
+    }
+
+    /// 守门：系统目录部署**默认关**，只由 `system_deploy` 标记开启。
+    ///
+    /// 默认值本身就是这个特性的要点——`System32\IME\` 与 `InstallDir` 是与安装版共用的
+    /// 落点，默认开会让同机共存的两者互相覆盖。翻转默认值必须先改到这条断言。
+    #[test]
+    fn system_deploy_defaults_off_and_opts_in_by_marker() {
+        let v = Variant::new(false);
+        let root = tempdir();
+        std::fs::write(root.join("wind_input.exe"), b"x").unwrap();
+        std::fs::write(root.join("wind_tsf.dll"), b"x").unwrap();
+
+        let cfg = detect_from(&v, std::slice::from_ref(&root)).unwrap();
+        assert!(!cfg.system_deploy, "无标记时必须默认就地部署");
+
+        std::fs::write(root.join(variant::SYSTEM_DEPLOY_MARKER_NAME), b"").unwrap();
+        let cfg = detect_from(&v, std::slice::from_ref(&root)).unwrap();
+        assert!(
+            cfg.system_deploy,
+            "有 system_deploy 标记时应开启系统目录部署"
+        );
     }
 
     #[test]

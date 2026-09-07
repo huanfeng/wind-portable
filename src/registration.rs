@@ -6,7 +6,7 @@
 
 use std::ffi::c_void;
 use std::os::windows::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{anyhow, bail, Result};
@@ -53,19 +53,110 @@ pub fn unregister(cfg: &PortableConfig, variant: &Variant) -> Result<()> {
     }
 }
 
+/// TSF DLL 的系统目录落点：`%SystemRoot%\System32\IME\<app_name>\<dll>`
+/// （x86 → `SysWOW64\IME\<app_name>\`）。布局对齐 inbox IME 与安装版。
+///
+/// 为什么便携模式也要往系统目录放：开启 Trusted Mode 的游戏（CS2 等）按**加载路径**
+/// 决定放不放行 in-proc DLL，便携目录里的副本连加载都会被拒。便携模式本就需要管理员
+/// 权限、本就往 HKLM 写 COM 注册，「不碰系统目录」并不是它与安装版真正的分界线；
+/// 两边行为一致，才不会出现「安装版游戏里能打字、便携版不能」这种没道理的差别。
+fn system_dll_path(variant: &Variant, x86: bool) -> PathBuf {
+    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let root = if x86 { "SysWOW64" } else { "System32" };
+    let name = if x86 {
+        &variant.dll_name_x86
+    } else {
+        &variant.dll_name
+    };
+    Path::new(&sysroot)
+        .join(root)
+        .join("IME")
+        .join(variant.app_name)
+        .join(name)
+}
+
+/// 应用注册表键 `HKLM\Software\<app_name>`——存 `InstallDir`，与安装版同一个键。
+fn app_reg_subkey(variant: &Variant) -> String {
+    format!(r"Software\{}", variant.app_name)
+}
+
+/// 读回 `InstallDir`（当前持有注册的那个目录）。
+fn registered_install_dir(variant: &Variant) -> Option<String> {
+    crate::reg::read_string(
+        crate::reg::HKEY_LOCAL_MACHINE,
+        &app_reg_subkey(variant),
+        "InstallDir",
+    )
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+}
+
+/// 复制到系统目录 → 授予 AppContainer 读权限 → 对**系统副本** regsvr32。
+///
+/// 授权与注册都针对系统副本：`DllRegisterServer` 用 `GetModuleFileName` 取被加载模块
+/// 的路径写进 `InprocServer32`，对哪个副本跑 regsvr32 就指向哪个副本。
+fn deploy_and_register(src: &Path, dst: &Path, x86: bool) -> Result<()> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow!("创建系统目录失败 {}: {e}", parent.display()))?;
+    }
+    std::fs::copy(src, dst).map_err(|e| anyhow!("复制到系统目录失败 {}: {e}", dst.display()))?;
+    grant_app_packages_access(dst);
+    regsvr32(dst, x86, false)
+}
+
+/// 系统目录里那份副本是不是**本便携实例**部署的。
+///
+/// ⚠️ 系统副本路径对安装版与所有便携实例**完全相同**（`System32\IME\<app_name>\`），
+/// 反注册/删除前必须先问这一句——无条件动手会把安装版的副本一并删掉，那边的输入法
+/// 就废了。凭据是 `InstallDir` 指回本便携目录：谁最后部署，它就指向谁。
+fn owns_system_deployment(cfg: &PortableConfig, variant: &Variant) -> bool {
+    registered_install_dir(variant)
+        .is_some_and(|dir| same_path(&dir, &cfg.root_dir.to_string_lossy()))
+}
+
 /// 已提权后的直接注册。
+///
+/// 两条路径由 `cfg.system_deploy`（`system_deploy` 标记文件）决定，**默认走就地注册**：
+/// `System32\IME\` 与 `HKLM\Software\<app>\InstallDir` 都是与安装版共用的落点，
+/// 同机共存时会互相覆盖，默认不碰即零冲突。
 pub fn register_direct(cfg: &PortableConfig, variant: &Variant) -> Result<()> {
     let dll = cfg
         .tsf_dll
         .as_deref()
         .ok_or_else(|| anyhow!("未找到 TSF DLL，请先构建 {}", variant.dll_name))?;
 
-    grant_app_packages_access(dll);
-    regsvr32(dll, false, false)?;
+    if cfg.system_deploy {
+        // 便携目录回指。DLL 搬进系统目录后 `GetModuleFileName` 只能取到系统副本路径，
+        // 服务拉起与便携标记检测都改读这个键（读端 wind_tsf 的 `_ResolveAppBaseDir`）。
+        // 必须写在 regsvr32 之前：注册一完成宿主就可能加载 DLL，那时键还不在就会走空。
+        // 它同时是本实例对系统副本的所有权凭据——系统副本各实例路径相同，靠路径已分不出
+        // 是谁注册的（见 [`owns_system_deployment`]）。
+        if !crate::reg::set_string(
+            crate::reg::HKEY_LOCAL_MACHINE,
+            &app_reg_subkey(variant),
+            "InstallDir",
+            &cfg.root_dir.to_string_lossy(),
+        ) {
+            bail!("写入 InstallDir 失败（需要管理员权限）");
+        }
 
-    if let Some(x86) = cfg.tsf_dll_x86.as_deref() {
-        grant_app_packages_access(x86);
-        let _ = regsvr32(x86, true, false); // x86 失败不致命（部分系统无 WOW64）
+        deploy_and_register(dll, &system_dll_path(variant, false), false)?;
+
+        if let Some(x86) = cfg.tsf_dll_x86.as_deref() {
+            // x86 失败不致命（部分系统无 WOW64）
+            let _ = deploy_and_register(x86, &system_dll_path(variant, true), true);
+        }
+    } else {
+        // 默认：就地注册。DLL 留在便携目录，`GetModuleFileName` 推得出便携根，
+        // wind_tsf 的 `_ResolveAppBaseDir` 回退到模块路径即可定位，无需写 InstallDir。
+        grant_app_packages_access(dll);
+        regsvr32(dll, false, false)?;
+
+        if let Some(x86) = cfg.tsf_dll_x86.as_deref() {
+            grant_app_packages_access(x86);
+            let _ = regsvr32(x86, true, false); // x86 失败不致命（部分系统无 WOW64）
+        }
     }
 
     if !install_layout_or_tip(variant.profile_str, 0) {
@@ -77,6 +168,34 @@ pub fn register_direct(cfg: &PortableConfig, variant: &Variant) -> Result<()> {
 /// 已提权后的直接注销（尽力而为，单步失败不阻断后续）。
 pub fn unregister_direct(cfg: &PortableConfig, variant: &Variant) {
     let _ = install_layout_or_tip(variant.profile_str, ILOT_UNINSTALL);
+
+    // 系统副本：**只动本实例部署的那份**。路径与安装版完全相同，无条件删会废掉安装版。
+    // 判据用 owns_system_deployment 而不是 cfg.system_deploy：用户可能注册后才关掉开关，
+    // 那时标记已没了、副本却还在，照 cfg 判就会漏清。
+    if owns_system_deployment(cfg, variant) {
+        for x86 in [true, false] {
+            let sys = system_dll_path(variant, x86);
+            if sys.is_file() {
+                let _ = regsvr32(&sys, x86, true);
+                let _ = std::fs::remove_file(&sys);
+            }
+        }
+        // 收掉自建子目录。`remove_dir` 只删空目录——另一架构的副本还在（或删不掉）时
+        // 自然失败，正是需要的语义。
+        for x86 in [true, false] {
+            if let Some(parent) = system_dll_path(variant, x86).parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+        let _ = crate::reg::delete_value(
+            crate::reg::HKEY_LOCAL_MACHINE,
+            &app_reg_subkey(variant),
+            "InstallDir",
+        );
+    }
+
+    // 就地注册的副本（默认路径，以及存量便携包）照常反注册一次，否则那条 CLSID 会
+    // 滞留、且指向一个随后可能被删掉的路径。
     if let Some(x86) = cfg.tsf_dll_x86.as_deref() {
         let _ = regsvr32(x86, true, true);
     }
@@ -85,7 +204,13 @@ pub fn unregister_direct(cfg: &PortableConfig, variant: &Variant) {
     }
 }
 
-/// 本便携 DLL 是否已注册（注册的 CLSID InprocServer32 指向本 DLL）。
+/// 本便携实例是否持有当前注册。
+///
+/// 两种形态分开判：
+/// - **就地注册**（默认）：便携目录里的 DLL 路径本身唯一，直接比路径即可。
+/// - **系统目录部署**：⚠️ 不能比路径——同一变体的所有实例（含安装版）算出的系统副本
+///   路径**完全相同**，比了等于恒真。所有权只能由 `InstallDir` 判定，见
+///   [`owns_system_deployment`]。
 pub fn is_registered(cfg: &PortableConfig, variant: &Variant) -> bool {
     let Some(reg_path) = registered_dll_path(variant) else {
         return false;
@@ -93,6 +218,12 @@ pub fn is_registered(cfg: &PortableConfig, variant: &Variant) -> bool {
     let Some(dll) = cfg.tsf_dll.as_deref() else {
         return false;
     };
+
+    let sys = system_dll_path(variant, false);
+    if same_path(&reg_path, &sys.to_string_lossy()) {
+        return owns_system_deployment(cfg, variant);
+    }
+
     same_path(&reg_path, &dll.to_string_lossy())
 }
 
@@ -119,16 +250,27 @@ pub fn installed_conflict(
     }
     // 3. 其他位置注册了 DLL？
     let reg_path = registered_dll_path(variant)?;
-    let dll = cfg.tsf_dll.as_deref()?;
-    if same_path(&reg_path, &dll.to_string_lossy()) {
-        return None;
+    cfg.tsf_dll.as_deref()?; // 没有 DLL 就谈不上冲突（注册本身会失败）
+    if is_registered(cfg, variant) {
+        return None; // 当前注册就是本实例做的
     }
     // 注册文件已不存在 → 残留注册，可安全接管。
     if !Path::new(&reg_path).is_file() {
         return None;
     }
-    // 不同位置的 DLL 已注册，判断来源。
-    if has_portable_marker(&reg_path) {
+    // 不同位置的 DLL 已注册，判断来源目录。
+    //
+    // ⚠️ 注册指向系统副本时，来源目录只能从 `InstallDir` 取——系统副本旁边不可能有
+    // 便携标记，照旧看「注册路径的同级目录」会把每一个便携实例都误判成安装版。
+    let owner_dir = if same_path(
+        &reg_path,
+        &system_dll_path(variant, false).to_string_lossy(),
+    ) {
+        registered_install_dir(variant).map(PathBuf::from)
+    } else {
+        Path::new(&reg_path).parent().map(Path::to_path_buf)
+    };
+    if owner_dir.as_deref().is_some_and(has_portable_marker_in) {
         if !service_running {
             return None; // 残留便携注册，服务未运行，可接管。
         }
@@ -316,16 +458,6 @@ fn is_installed_directory(root: &Path, variant: &Variant) -> bool {
         }
     }
     root.join("uninstall.exe").is_file()
-}
-
-/// DLL 同级是否存在便携标记文件（不向上遍历）。新旧两名都认，见
-/// [`crate::variant::LEGACY_PORTABLE_MARKER_NAME`]——只认新名会把存量便携实例
-/// 误判成安装版注册，进而拒绝接管。
-fn has_portable_marker(dll_path: &str) -> bool {
-    Path::new(dll_path)
-        .parent()
-        .map(has_portable_marker_in)
-        .unwrap_or(false)
 }
 
 /// 路径大小写不敏感比较：统一分隔符为 `\`、去尾分隔符、转小写后比较。
