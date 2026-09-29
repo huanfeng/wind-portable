@@ -14,7 +14,7 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-use crate::layout::PortableConfig;
+use crate::layout::{self, PortableConfig};
 use crate::variant::Variant;
 use crate::{deploy, process, reg, registration, rpc};
 
@@ -240,7 +240,9 @@ impl ServiceManager {
     /// 创建便携目录布局与标记文件。
     fn ensure_portable_layout(&self) -> Result<()> {
         let data = &self.cfg.userdata_dir;
-        for sub in ["", "logs", "cache", "themes"] {
+        // cache / logs 属于同级的 localdata，不在这里建（见 layout::USERDATA_SUBDIRS）。
+        let subs = std::iter::once("").chain(layout::USERDATA_SUBDIRS.iter().copied());
+        for sub in subs {
             let dir = if sub.is_empty() {
                 data.clone()
             } else {

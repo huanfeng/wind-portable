@@ -9,6 +9,13 @@ use anyhow::{bail, Result};
 
 use crate::variant::{self, Variant};
 
+/// 启动器要在 `userdata/` 下预建的子目录（`userdata` 本身另建）。
+///
+/// **只放用户数据**。`cache` / `logs` 是本机状态，便携形态下在同级的 `localdata/`
+/// （见 wind-config 的 `portable_localdata_dir`，论坛 t120），由服务端按需自建；
+/// 这里再建就会在 `userdata/` 下留两个永远为空的壳（论坛 t252）。
+pub const USERDATA_SUBDIRS: &[&str] = &["themes"];
+
 /// 探测到的便携布局。
 #[derive(Debug, Clone)]
 pub struct PortableConfig {
@@ -187,6 +194,14 @@ mod tests {
             std::env::temp_dir().join(format!("wind_portable_layout_{}_{}", std::process::id(), n));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// 守门：`userdata/` 下不得预建本机状态目录（论坛 t252）。
+    #[test]
+    fn userdata_subdirs_exclude_local_state() {
+        for bad in ["cache", "logs"] {
+            assert!(!USERDATA_SUBDIRS.contains(&bad), "{bad} 属于 localdata");
+        }
     }
 
     #[test]
