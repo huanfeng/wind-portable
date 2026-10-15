@@ -152,4 +152,4 @@ git config core.hooksPath .githooks
 
 ## 许可证
 
-提交贡献即表示您同意您的贡献将按照项目的 [MIT 许可证](LICENSE) 进行授权。
+本项目采用 [GPL-3.0-or-later](LICENSE) 许可证。提交贡献即表示您同意按照 [CLA](CLA.md) 的条款授权您的贡献。

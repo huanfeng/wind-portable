@@ -79,7 +79,11 @@ active 窗口续帧）详见该文档"关键设计"节。
 
 ## 许可证
 
-本项目采用 [MIT 许可证](LICENSE)。
+本项目自 2026 年 10 月 15 日起采用 [GNU 通用公共许可证第 3 版或更高版本](LICENSE)（GPL-3.0-or-later），
+此前发布的版本仍适用其发布时的 MIT 许可证。
+
+项目名称「清风输入法」「WindInput」与 logo 的使用见主仓库的
+[项目名称与标识使用约定](https://github.com/huanfeng/WindInput/blob/main/BRANDING.md)。
 
 ## 状态
 
